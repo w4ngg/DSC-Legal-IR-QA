@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsc-legal-ir"
+version = "0.1.0"
+description = "DSC 2026 LegalIR: BM25 + Vietnamese dense + HyDE + Vietnamese reranker"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=1,<2",
+  "bm25s>=0.3.10,<0.4",
+  "faiss-cpu>=1.8,<2",
+  "numpy>=1.26,<3",
+  "PyYAML>=6,<7",
+  "sentence-transformers>=5,<6",
+  "torch>=2.4",
+  "transformers>=4.51,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+legal-ir = "legal_ir.cli:main"
+legal-ir-chunk-fixed-size = "legal_ir.chunk_fixed_size:main"
+legal-ir-create-val-test = "legal_ir.create_val_test:main"
+legal-ir-evaluate = "legal_ir.evaluate_recall_precision:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

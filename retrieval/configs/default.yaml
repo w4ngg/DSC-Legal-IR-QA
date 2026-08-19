@@ -1,0 +1,53 @@
+# Đây là baseline ưu tiên recall. Các top-k cần được tune trên validation sạch.
+bm25:
+  method: lucene
+  k1: 1.2
+  b: 0.75
+  top_k_chunks: 300
+  mmap: true
+
+dense:
+  model_name: AITeamVN/Vietnamese_Embedding_v2
+  revision: 18b44161e041bf1d3a333ab5144b5b7b93f914d2
+  top_k_chunks: 200
+  batch_size: 8
+  max_length: 2048
+  device: auto
+  dtype: auto
+  normalize_embeddings: true
+  index_type: flat
+  hnsw_m: 32
+  hnsw_ef_construction: 200
+  hnsw_ef_search: 128
+
+hyde:
+  enabled: true
+  model_name: AITeamVN/Vi-Qwen2-3B-RAG
+  revision: eaf427c24d86066a2b35828c499b7db3af321227
+  top_k_chunks: 200
+  max_new_tokens: 192
+  do_sample: false
+  temperature: 0.7
+  top_p: 0.8
+  device: auto
+  dtype: auto
+  trust_remote_code: false
+
+fusion:
+  rrf_k: 60
+  candidate_documents: 50
+  evidence_chunks_per_document: 2
+  channel_weights:
+    bm25: 1.0
+    dense: 1.0
+    hyde: 0.5
+
+reranker:
+  enabled: true
+  model_name: AITeamVN/Vietnamese_Reranker
+  revision: f536976248403314225d7fdfdbc87f0e9516a54e
+  batch_size: 4
+  max_length: 2304
+  device: auto
+  dtype: auto
+  final_top_k_documents: 5
