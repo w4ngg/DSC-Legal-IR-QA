@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from legal_ir.config import DenseConfig, HyDEConfig, PipelineConfig, RerankerConfig
 from legal_ir.dense import VietnameseEmbeddingEncoder
-from legal_ir.hyde import QwenHyDEGenerator, SYSTEM_PROMPT
+from legal_ir.hyde import QwenHyDEGenerator, SYSTEM_PROMPT, normalize_hyde_text
 from legal_ir.reranker import VietnameseCrossEncoderReranker
 
 
@@ -175,7 +175,7 @@ class _FakeTokenizer:
 
     def decode(self, tokens: list[int], **kwargs: object) -> str:
         self.decode_calls.append((tokens, kwargs))
-        return "  đoạn luật giả định  "
+        return "  đoạn\r\nluật\\n giả định  "
 
 
 class _FakeModel:
@@ -204,6 +204,21 @@ class _FakeTorch:
 
 
 class AITeamVNHyDETest(unittest.TestCase):
+    def test_hyde_normalizer_removes_generation_artifacts_only(self) -> None:
+        raw = (
+            "\ufeff```text\r\n"
+            "  Điều\u200b1.\t Áp dụng pha\u0301p luật và 50% mức phạt\\r\\n"
+            "  theo Khoản 2.&nbsp;\x00```"
+        )
+
+        normalized = normalize_hyde_text(raw)
+
+        self.assertEqual(
+            normalized,
+            "Điều 1. Áp dụng pháp luật và 50% mức phạt theo Khoản 2.",
+        )
+        self.assertEqual(normalize_hyde_text(normalized), normalized)
+
     def test_qwen2_prompt_is_deterministic_and_generation_uses_kv_cache(self) -> None:
         config = HyDEConfig(
             model_name="AITeamVN/Vi-Qwen2-3B-RAG",

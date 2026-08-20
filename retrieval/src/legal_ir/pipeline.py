@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from .config import PipelineConfig
 from .fusion import weighted_rrf
+from .hyde import normalize_hyde_text
 from .interfaces import (
     ChunkRetriever,
     HypotheticalDocumentGenerator,
@@ -128,7 +129,7 @@ class RetrievalPipeline:
         hypothesis: str | None = None
         if self.config.hyde.enabled:
             assert self.hyde_generator is not None
-            hypothesis = self.hyde_generator.generate(query).strip()
+            hypothesis = normalize_hyde_text(self.hyde_generator.generate(query))
             if not hypothesis:
                 raise ValueError("HyDE generator returned an empty document")
             # HyDE is intentionally a dense-only lane: never BM25 the hallucination.

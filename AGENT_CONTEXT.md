@@ -181,6 +181,7 @@ Các quyết định quan trọng:
 - Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Vi-Qwen được ép `use_cache=True`; adapter Qwen2 không truyền `enable_thinking` của Qwen3.
 - Không so sánh/cộng raw BM25, cosine và HyDE score. Từng lane gom chunk về document bằng max score, sau đó fusion rank bằng weighted RRF (`k=60`; weight mặc định 1,0/1,0/0,5).
 - HyDE là dense-only lane. Không chạy BM25 trên đoạn do SLM sinh; reranker chỉ nhận query gốc và chunk thật.
+- Text do HyDE sinh được canonicalize bằng policy versioned `hyde_nfc_ws_v1` tại generator, cache và trước dense retrieval: Unicode NFC; line break/tab thật và literal `\\n`/`\\r`/`\\t`; HTML non-breaking-space allowlist; control/zero-width characters; code fence và whitespace thừa được dọn. Không lowercase, bỏ dấu, sửa punctuation, số hoặc viện dẫn pháp luật. Version nằm trong cache namespace nên cache cũ tự miss thay vì đưa raw hypothesis vào dense lane.
 - Default lấy BM25 top 300 chunks, dense query top 200, dense HyDE top 200, fuse top 50 documents, rerank tối đa 2 evidence chunks/document, output 5 document IDs. Đây là giá trị khởi đầu, chưa được tune trên DSC.
 - Input contract là JSONL gồm `chunk_id`, `document_id`, `passage`, `retrieval_text` tùy chọn và `metadata`. `retrieval_text` nên ghép metadata title/Điều/Khoản với passage; nếu thiếu thì dùng `passage`.
 - BM25, FAISS và chunk store dùng chung stable row order; manifest kiểm tra hash mapping/nội dung. Output luôn dùng `document_id` dạng chuỗi.
@@ -218,7 +219,7 @@ Ngày 2026-08-20 đã thêm hai utility chỉ dùng Python standard library:
 - Split được random ở cấp nhóm câu hỏi sau NFC + `casefold` + collapse whitespace. 16 nhóm câu hỏi trùng trong train vì vậy không bị tách qua các split; manifest lưu SHA-256, phân phối số gold documents và thống kê 5 nhóm duplicate có nhãn xung đột. Baseline này chưa stratify theo số gold documents; không nhập warmup vào train mới nếu chưa kiểm tra overlap.
 - `retrieval/src/legal_ir/evaluate_recall_precision.py` cùng entrypoint `legal-ir-evaluate`: tính official macro Recall và macro Precision trên toàn bộ gold queries. Query thiếu được tính như prediction rỗng, query dư được báo/không vào mẫu số, raw answer dài hơn 5 nhận 0/0, duplicate ID được báo là contract invalid.
 - Gold phải có `answer` là list ID chuỗi không rỗng; `IR/public-official.json` có nhãn null nên evaluator chủ động từ chối.
-- 11 unit tests cho hai utility đã pass; toàn bộ suite hiện là 34/34 test, không tải model/GPU. Default split đã được kiểm tra read-only trên dữ liệu thật và cho đúng 5.600/700/700; chưa tạo split artifact thật trong workspace.
+- 11 unit tests cho hai utility đã pass; sau khi thêm HyDE normalization/cache invariant, toàn bộ suite hiện là 39/39 test, không tải model/GPU. Default split đã được kiểm tra read-only trên dữ liệu thật và cho đúng 5.600/700/700; chưa tạo split artifact thật trong workspace.
 
 ## Thư mục nghiên cứu phương pháp
 

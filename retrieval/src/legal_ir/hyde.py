@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +12,71 @@ from .interfaces import HypotheticalDocumentGenerator
 from .runtime import detected_torch_device, inference_torch_dtype
 
 
-SYSTEM_PROMPT = """Bạn là mô-đun HyDE cho hệ thống tìm kiếm pháp luật Việt Nam.
-Đây là tác vụ sinh văn bản truy vấn tổng hợp, không phải tư vấn pháp luật và không cần ngữ cảnh truy xuất.
-Hãy tạo đúng một đoạn mô tả pháp lý giả định có khả năng liên quan trực tiếp đến câu hỏi.
-Đoạn văn phải nêu rõ chủ thể, hành vi, điều kiện, ngoại lệ, thủ tục hoặc chế tài liên quan.
-Không bịa số hiệu văn bản, số Điều, số Khoản, ngày ban hành hoặc mức tiền nếu câu hỏi không cung cấp.
-Không giải thích cách làm, không dùng Markdown và không nói rằng đây là văn bản giả định."""
+SYSTEM_PROMPT = """Bạn đang tạo một đoạn văn giả định chỉ phục vụ truy xuất thông tin
+trong kho văn bản pháp luật tiếng Việt.
+
+Từ câu hỏi của người dùng, hãy viết một đoạn văn ngắn mô phỏng
+cách nội dung liên quan có thể được diễn đạt trong một văn bản pháp luật.
+
+Yêu cầu:
+- Giữ nguyên các thực thể, điều kiện và phạm vi xuất hiện trong câu hỏi.
+- Có thể mở rộng bằng các thuật ngữ pháp lý đồng nghĩa hoặc liên quan trực tiếp.
+- KHÔNG tự tạo số hiệu văn bản, Điều, Khoản, Điểm nếu câu hỏi không cung cấp.
+- KHÔNG tự đoán con số, thời hạn, mức tiền, tỷ lệ hoặc ngưỡng.
+- KHÔNG tự tạo cơ quan, đối tượng hoặc ngoại lệ chưa xuất hiện trong câu hỏi.
+- Không trả lời câu hỏi.
+- Mục tiêu là tạo văn bản giàu từ khóa và ngữ nghĩa để retrieval, không phải tạo câu trả lời chính xác.
+Chỉ trả về đoạn văn giả định, không giải thích."""
 
 USER_PROMPT_TEMPLATE = """Câu hỏi về pháp luật:
 {query}
 
 Viết đoạn văn liên quan dài khoảng 80–180 từ."""
+
+HYDE_NORMALIZATION_VERSION = "hyde_nfc_ws_v1"
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_ESCAPED_WHITESPACE = re.compile(r"\\(?:r\\n|[nrtfv])", re.IGNORECASE)
+_HTML_SPACE_ENTITY = re.compile(r"&(?:nbsp|#0*160|#x0*a0);", re.IGNORECASE)
+_MARKDOWN_CODE_FENCE = re.compile(
+    r"```(?:text|plaintext|markdown|vietnamese|vi)?",
+    re.IGNORECASE,
+)
+_WHITESPACE = re.compile(r"\s+")
+_INVISIBLE_TRANSLATION = str.maketrans(
+    {
+        "\u00ad": None,  # soft hyphen
+        "\u200b": " ",  # zero-width space must not join adjacent words
+        "\u200c": None,  # zero-width non-joiner
+        "\u200d": None,  # zero-width joiner
+        "\u200e": None,  # left-to-right mark
+        "\u200f": None,  # right-to-left mark
+        "\u2060": None,  # word joiner
+        "\ufeff": None,  # byte-order mark
+        "\u2028": " ",  # Unicode line separator
+        "\u2029": " ",  # Unicode paragraph separator
+    }
+)
+
+
+def normalize_hyde_text(value: str) -> str:
+    """Remove generation artifacts without changing Vietnamese legal semantics.
+
+    Both real line breaks and literal escaped whitespace such as ``\\n`` are
+    collapsed. Accents, case, punctuation, numbers, and legal citations remain.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("HyDE output must be a string")
+    text = unicodedata.normalize("NFC", value)
+    text = _HTML_SPACE_ENTITY.sub(" ", text)
+    text = _ESCAPED_WHITESPACE.sub(" ", text)
+    text = _MARKDOWN_CODE_FENCE.sub(" ", text)
+    text = text.replace("```", " ")
+    text = text.translate(_INVISIBLE_TRANSLATION)
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    text = _CONTROL_CHARACTERS.sub(" ", text)
+    return _WHITESPACE.sub(" ", text).strip()
 
 
 def hyde_cache_namespace(config: HyDEConfig) -> str:
@@ -38,6 +94,7 @@ def hyde_cache_namespace(config: HyDEConfig) -> str:
         "trust_remote_code": config.trust_remote_code,
         "system_prompt": SYSTEM_PROMPT,
         "user_prompt_template": USER_PROMPT_TEMPLATE,
+        "output_normalization_version": HYDE_NORMALIZATION_VERSION,
     }
     canonical = json.dumps(
         generation_config,
@@ -134,10 +191,11 @@ class QwenHyDEGenerator:
         with torch.inference_mode():
             output = model.generate(**inputs, **generation_kwargs)
         input_length = int(inputs["input_ids"].shape[-1])
-        hypothesis = tokenizer.decode(
+        raw_hypothesis = tokenizer.decode(
             output[0, input_length:],
             skip_special_tokens=True,
-        ).strip()
+        )
+        hypothesis = normalize_hyde_text(raw_hypothesis)
         if not hypothesis:
             raise RuntimeError("HyDE model returned an empty hypothetical document")
         return hypothesis
@@ -164,11 +222,20 @@ class JsonlCachedHyDEGenerator:
                         continue
                     try:
                         value = json.loads(line)
-                        if value.get("namespace") == namespace:
-                            self._cache[str(value["key"])] = str(value["hypothesis"])
-                    except (json.JSONDecodeError, KeyError, TypeError):
+                    except json.JSONDecodeError:
                         # A cache is disposable; tolerate a partial final append after a crash.
                         continue
+                    if not isinstance(value, dict):
+                        continue
+                    if value.get("namespace") != namespace:
+                        continue
+                    key = value.get("key")
+                    hypothesis = value.get("hypothesis")
+                    if not isinstance(key, str) or not isinstance(hypothesis, str):
+                        continue
+                    hypothesis = normalize_hyde_text(hypothesis)
+                    if hypothesis:
+                        self._cache[key] = hypothesis
 
     def _key(self, query: str) -> str:
         payload = f"{self.namespace}\0{query.strip()}".encode("utf-8")
@@ -178,7 +245,9 @@ class JsonlCachedHyDEGenerator:
         key = self._key(query)
         if key in self._cache:
             return self._cache[key]
-        hypothesis = self.generator.generate(query)
+        hypothesis = normalize_hyde_text(self.generator.generate(query))
+        if not hypothesis:
+            raise RuntimeError("HyDE generator returned an empty hypothetical document")
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with self.cache_path.open("a", encoding="utf-8") as handle:
             handle.write(

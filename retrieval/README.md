@@ -20,6 +20,7 @@ Các nguyên tắc đã được khóa trong implementation và unit test:
 - Không cộng hoặc so sánh trực tiếp raw score của BM25, cosine và HyDE.
 - Mỗi lane gom chunk về document bằng MaxP rồi mới dùng weighted RRF.
 - HyDE chỉ chạy qua dense retrieval; BM25 luôn dùng câu hỏi thật.
+- Output HyDE được chuẩn hóa trước khi vào dense search và diagnostics: Unicode NFC, xuống dòng/control/invisible characters, literal `\\n`/`\\r`/`\\t`, code fence và khoảng trắng thừa được collapse; chữ hoa/thường, dấu tiếng Việt, số, dấu câu và viện dẫn pháp luật được giữ nguyên.
 - Reranker luôn dùng câu hỏi gốc và `retrieval_text` của chunk thật, không dùng hypothetical document.
 - Trong các evidence đưa vào reranker, code giữ ít nhất một chunk do query gốc tìm được nếu document có chunk như vậy; HyDE không được chiếm toàn bộ evidence slots.
 - Output được deduplicate ở cấp document và bị giới hạn tối đa 5 ID.
@@ -89,6 +90,8 @@ Baseline fixed-size nằm riêng trong `src/legal_ir/chunk_fixed_size.py` để 
 - ghi từng artifact qua temporary file riêng rồi atomic replace; manifest được commit cuối và chứa SHA-256 để phát hiện output không đồng bộ sau interruption.
 
 Bước này chỉ tải tokenizer, không tải weights embedding và không cần bật GPU Kaggle.
+
+Sau khi `json.load` đọc document, escape JSON `\n` và `\r` đã trở thành ký tự xuống dòng/carriage-return thật. `normalize_legal_text()` collapse chúng cùng tab và mọi whitespace liên tiếp thành đúng một dấu cách, nên `passage` sau normalize không còn line break. Chuỗi literal `/n` hoặc `/r` (dấu gạch chéo xuôi rồi tới chữ) không phải ký tự xuống dòng và được giữ nguyên.
 
 Trong Kaggle notebook, sau khi cài package, chạy:
 
@@ -233,7 +236,9 @@ legal-ir search \
 }
 ```
 
-File diagnostics giữ đầy đủ top candidate theo thứ tự trước rerank, fusion score, reranker score, raw score/rank trong từng channel, evidence chunk ID và hypothetical document để phân tích lỗi. Không nộp file diagnostics. Cache HyDE được fingerprint theo model revision, prompt và generation config, nên thay đổi thí nghiệm không tái dùng nhầm hypothesis cũ.
+File diagnostics giữ đầy đủ top candidate theo thứ tự trước rerank, fusion score, reranker score, raw score/rank trong từng channel, evidence chunk ID và hypothetical document để phân tích lỗi. Không nộp file diagnostics.
+
+HyDE dùng policy `hyde_nfc_ws_v1`: output từ Qwen, output đọc từ cache và text ngay trước dense retrieval đều được đưa về cùng dạng canonical. Ngoài line break thật, policy còn xử lý literal `\\n`, `\\r`, `\\t` mà model có thể sinh ra dưới dạng hai ký tự escape, cùng control/zero-width characters, non-breaking space và code fence. Policy không lowercase, không bỏ dấu, không sửa con số hay citation. Phiên bản policy nằm trong fingerprint cache cùng model revision, prompt và generation config; vì vậy các dòng cache cũ vẫn có thể nằm trong cùng file JSONL nhưng sẽ không được tái sử dụng sau thay đổi này.
 
 ## 7. Đánh giá Recall và Precision
 
@@ -289,7 +294,7 @@ Nên đo ít nhất candidate Recall@50 trước reranker, Recall@5/Precision@5 
 PYTHONPATH=retrieval/src python -m unittest discover -s retrieval/tests -v
 ```
 
-Test dùng backend giả để kiểm tra fusion, document aggregation, BM25 zero-score padding, đường đi/cache HyDE, input của reranker, evidence grounding, config, schema submission, random grouped split và metric Recall/Precision.
+Test dùng backend giả để kiểm tra fusion, document aggregation, BM25 zero-score padding, chuẩn hóa/đường đi/cache HyDE, input của reranker, evidence grounding, config, schema submission, random grouped split và metric Recall/Precision.
 
 ## Tài liệu API/model
 

@@ -124,6 +124,24 @@ class RetrievalPipelineTest(unittest.TestCase):
         self.assertNotIn(self.hypothesis, reranker.passages)
         self.assertEqual(response.hypothetical_document, self.hypothesis)
 
+    def test_hyde_output_is_normalized_before_dense_search(self) -> None:
+        normalized = "Đoạn pháp luật giả định"
+        raw = "  Đoạn pha\u0301p\r\nluật\\n giả định  "
+        bm25 = StaticRetriever({self.query: []})
+        dense = StaticRetriever({self.query: [], normalized: []})
+        pipeline = RetrievalPipeline(
+            chunks=self.chunks,
+            bm25=bm25,
+            dense=dense,
+            hyde_generator=StaticHyDE(raw),
+            config=pipeline_config(reranker=False),
+        )
+
+        response = pipeline.search(self.query)
+
+        self.assertEqual(dense.calls, [(self.query, 10), (normalized, 10)])
+        self.assertEqual(response.hypothetical_document, normalized)
+
     def test_ablation_can_disable_hyde_and_reranker(self) -> None:
         bm25 = StaticRetriever({self.query: [ScoredChunk("a-1", "A", 10.0)]})
         dense = StaticRetriever({self.query: [ScoredChunk("b-1", "B", 0.9)]})
