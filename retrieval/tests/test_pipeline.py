@@ -14,9 +14,13 @@ class StaticRetriever:
     def __init__(self, results: dict[str, list[ScoredChunk]]) -> None:
         self.results = results
         self.calls: list[tuple[str, int]] = []
+        self.input_types: list[str] = []
 
-    def search(self, query: str, top_k: int) -> list[ScoredChunk]:
+    def search(
+        self, query: str, top_k: int, *, input_type: str = "query"
+    ) -> list[ScoredChunk]:
         self.calls.append((query, top_k))
+        self.input_types.append(input_type)
         return self.results.get(query, [])[:top_k]
 
 
@@ -119,6 +123,7 @@ class RetrievalPipelineTest(unittest.TestCase):
             dense.calls,
             [(self.query, 10), (self.hypothesis, 10)],
         )
+        self.assertEqual(dense.input_types, ["query", "document"])
         self.assertEqual(hyde.calls, [self.query])
         self.assertEqual(reranker.query, self.query)
         self.assertNotIn(self.hypothesis, reranker.passages)
@@ -141,6 +146,100 @@ class RetrievalPipelineTest(unittest.TestCase):
 
         self.assertEqual(dense.calls, [(self.query, 10), (normalized, 10)])
         self.assertEqual(response.hypothetical_document, normalized)
+
+    def test_deep_diagnostics_keeps_every_channel_before_fusion_cutoff(self) -> None:
+        bm25 = StaticRetriever(
+            {
+                self.query: [
+                    ScoredChunk("a-2", "A", 9.0),
+                    ScoredChunk("b-1", "B", 10.0),
+                    ScoredChunk("a-1", "A", 20.0),
+                    ScoredChunk("a-1", "A", 19.0),
+                    ScoredChunk("c-1", "C", float("nan")),
+                ]
+            }
+        )
+        dense = StaticRetriever(
+            {
+                self.query: [
+                    ScoredChunk("b-1", "B", 0.9),
+                    ScoredChunk("c-1", "C", 0.8),
+                ],
+                self.hypothesis: [
+                    ScoredChunk("c-1", "C", 0.95),
+                    ScoredChunk("a-1", "A", 0.7),
+                ],
+            }
+        )
+        config = pipeline_config(reranker=False)
+        config = replace(
+            config,
+            fusion=replace(config.fusion, candidate_documents=1),
+            reranker=replace(config.reranker, final_top_k_documents=1),
+        )
+        pipeline = RetrievalPipeline(
+            chunks=self.chunks,
+            bm25=bm25,
+            dense=dense,
+            hyde_generator=StaticHyDE(self.hypothesis),
+            config=config,
+        )
+
+        response, diagnostics = pipeline.search_with_deep_diagnostics(self.query)
+        payload = diagnostics.to_dict()
+
+        self.assertEqual(len(response.fused_candidates), 1)
+        self.assertEqual(set(payload["channels"]), {"bm25", "dense", "hyde"})
+        self.assertEqual(
+            [hit["chunk_id"] for hit in payload["channels"]["bm25"]["chunk_hits"]],
+            ["a-1", "b-1", "a-2"],
+        )
+        self.assertEqual(
+            payload["channels"]["bm25"]["document_hits"],
+            [
+                {
+                    "rank": 1,
+                    "document_id": "A",
+                    "score": 20.0,
+                    "best_chunk_id": "a-1",
+                    "best_chunk_rank": 1,
+                },
+                {
+                    "rank": 2,
+                    "document_id": "B",
+                    "score": 10.0,
+                    "best_chunk_id": "b-1",
+                    "best_chunk_rank": 2,
+                },
+            ],
+        )
+        self.assertEqual(payload["channels"]["dense"]["search_text"], self.query)
+        self.assertEqual(
+            payload["channels"]["hyde"]["search_text"], self.hypothesis
+        )
+        self.assertEqual(
+            payload["channels"]["hyde"]["search_text_source"],
+            "hypothetical_document",
+        )
+        self.assertEqual(bm25.calls, [(self.query, 10)])
+        self.assertEqual(
+            dense.calls,
+            [(self.query, 10), (self.hypothesis, 10)],
+        )
+        self.assertNotIn("channels", response.to_dict())
+
+    def test_deep_diagnostics_omits_disabled_hyde_channel(self) -> None:
+        pipeline = RetrievalPipeline(
+            chunks=self.chunks,
+            bm25=StaticRetriever({self.query: []}),
+            dense=StaticRetriever({self.query: []}),
+            config=pipeline_config(hyde=False, reranker=False),
+        )
+
+        _, diagnostics = pipeline.search_with_deep_diagnostics(self.query)
+
+        self.assertEqual(set(diagnostics.channels), {"bm25", "dense"})
+        self.assertIsNone(diagnostics.hypothetical_document)
 
     def test_ablation_can_disable_hyde_and_reranker(self) -> None:
         bm25 = StaticRetriever({self.query: [ScoredChunk("a-1", "A", 10.0)]})

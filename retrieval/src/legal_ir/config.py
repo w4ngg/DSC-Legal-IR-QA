@@ -25,6 +25,8 @@ class DenseConfig:
     device: str = "auto"
     dtype: str = "auto"
     normalize_embeddings: bool = True
+    multi_gpu: bool = True
+    multi_process_chunk_size: int | None = None
     index_type: str = "flat"
     hnsw_m: int = 32
     hnsw_ef_construction: int = 200
@@ -34,8 +36,8 @@ class DenseConfig:
 @dataclass(frozen=True, slots=True)
 class HyDEConfig:
     enabled: bool = True
-    model_name: str = "AITeamVN/Vi-Qwen2-3B-RAG"
-    revision: str | None = "eaf427c24d86066a2b35828c499b7db3af321227"
+    model_name: str = "AITeamVN/Vi-Qwen2-1.5B-RAG"
+    revision: str | None = "c8272ce4ad08da4cc27b4bda59faabc66caedf07"
     top_k_chunks: int = 200
     max_new_tokens: int = 192
     do_sample: bool = False
@@ -105,6 +107,18 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be numeric, got {value!r}") from exc
             if not math.isfinite(numeric_value) or numeric_value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if not isinstance(self.dense.multi_gpu, bool):
+            raise ValueError("dense.multi_gpu must be a boolean")
+        if self.dense.multi_process_chunk_size is not None:
+            chunk_size = self.dense.multi_process_chunk_size
+            if (
+                isinstance(chunk_size, bool)
+                or not isinstance(chunk_size, int)
+                or chunk_size <= 0
+            ):
+                raise ValueError(
+                    "dense.multi_process_chunk_size must be null or a positive integer"
+                )
         if self.reranker.final_top_k_documents > 5:
             raise ValueError(
                 "reranker.final_top_k_documents must be <= 5 for the Task 1 format"

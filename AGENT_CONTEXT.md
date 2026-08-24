@@ -1,6 +1,6 @@
 # DSC Legal — Context cho các session sau
 
-> Snapshot đã được đọc và kiểm tra toàn bộ vào 2026-08-15; khung retrieval Task 1 được cập nhật model stack vào 2026-08-20. Đọc tệp này đầu tiên khi bắt đầu làm việc trong workspace.
+> Snapshot đã được đọc và kiểm tra toàn bộ vào 2026-08-15; khung retrieval Task 1 được cập nhật dense adapter/multi-GPU vào 2026-08-24. Đọc tệp này đầu tiên khi bắt đầu làm việc trong workspace.
 
 ## Mục đích workspace
 
@@ -32,6 +32,7 @@ Hai tập câu hỏi IR và QA không dùng chung query ID. LegalQA không có n
 │   └── research_v1.md                       # draft phương pháp LegalIR đầu tiên
 ├── retrieval/                               # code pipeline khung Task 1
 │   ├── configs/default.yaml                 # model/top-k/RRF/reranker config
+│   ├── configs/vietlegal_harrier.yaml       # preset Harrier 0.6B, cần index riêng
 │   ├── pyproject.toml                       # package và dependency
 │   ├── README.md                            # chunk/split/evaluate/build/search/ablation
 │   ├── src/legal_ir/                        # chunker, split/evaluate, retrieval và CLI
@@ -40,7 +41,7 @@ Hai tập câu hỏi IR và QA không dùng chung query ID. LegalQA không có n
 └── test.ipynb                               # notebook khảo sát đơn giản, không phải baseline
 ```
 
-Corpus/dữ liệu gốc chiếm khoảng 501 MB. Workspace hiện có README, source và dependency cho **retrieval inference/indexing skeleton**, nhưng chưa có code training/fine-tuning, `AGENTS.md` hoặc thư mục `.git`; đừng dựa vào lệnh Git để lấy trạng thái thay đổi. Có một `.DS_Store` không liên quan.
+Corpus/dữ liệu gốc chiếm khoảng 501 MB. Workspace hiện có README, source và dependency cho **retrieval inference/indexing skeleton**, nhưng chưa có code training/fine-tuning hoặc `AGENTS.md`. Repo có `.git`; giữ nguyên mọi thay đổi người dùng/unrelated trong worktree. Có một `.DS_Store` không liên quan.
 
 Tài liệu overview có nêu `private-official.json` và `selected-contexts.zip` theo timeline cuộc thi, nhưng **các tệp private không có trong workspace** và corpus đã được giải nén ở `selected-contexts/`.
 
@@ -165,8 +166,8 @@ Kiến trúc đã code:
 
 ```text
 BM25(original query) ──────────────────┐
-Vietnamese_Embedding_v2(query) ────────┼─ MaxP chunk→document
-Vi-Qwen2-3B-RAG → HyDE → dense(HyDE) ──┘          ↓
+Dense SentenceTransformer(query) ──────┼─ MaxP chunk→document
+Vi-Qwen2-1.5B-RAG → HyDE → dense(HyDE) ─┘          ↓
                                        weighted document-level RRF
                                                     ↓ top candidates
                          Vietnamese_Reranker(query gốc, chunk thật)
@@ -176,25 +177,30 @@ Vi-Qwen2-3B-RAG → HyDE → dense(HyDE) ──┘          ↓
 
 Các quyết định quan trọng:
 
-- Default model từ ngày 2026-08-20: `AITeamVN/Vietnamese_Embedding_v2` (567.754.752 tham số), `AITeamVN/Vietnamese_Reranker` (567.755.777) và `AITeamVN/Vi-Qwen2-3B-RAG` (3.085.938.688). Tổng unique parameters chính xác là 4.221.449.217, vượt 4B khoảng 5,54%; người dùng đã chấp nhận sai số này cho pipeline Task 1. Config pin full revision SHA của cả ba checkpoint.
+- Default HyDE được đổi ngày 2026-08-24 sang `AITeamVN/Vi-Qwen2-1.5B-RAG`, revision `c8272ce4ad08da4cc27b4bda59faabc66caedf07`, chuẩn `Qwen2ForCausalLM`, 1.543.714.304 BF16 params. Cùng `AITeamVN/Vietnamese_Embedding_v2` (567.754.752) và `AITeamVN/Vietnamese_Reranker` (567.755.777), baseline có tổng chính xác 2.679.224.833 tham số và nằm dưới 4B.
 - `Vietnamese_Embedding_v2` dùng CLS pooling, L2 normalization, vector 1024 chiều; dense index vẫn là FAISS inner product. `Vietnamese_Reranker` là `XLMRobertaForSequenceClassification` một logit, được gọi qua `CrossEncoder` với Identity activation chứ không dùng như bi-encoder.
+- Dense ablation mới nằm ở `retrieval/configs/vietlegal_harrier.yaml`: `mainguyen9/vietlegal-harrier-0.6b`, revision `91a0e1ebe4b63b4475bbae40658b8ca9231bea74`, 596.049.920 tham số, Qwen3 backbone, last-token pooling, vector normalized 1024 chiều và native max length 512. Cả stack Harrier + reranker + HyDE 1.5B là 2.707.520.001 tham số, cao hơn baseline khoảng 28,3M nhưng vẫn dưới 4B.
+- Dense adapter là generic Sentence Transformers v5: query thật gọi `encode_query()` để Harrier tự dùng saved prompt `query`; corpus chunk và HyDE hypothetical passage gọi `encode_document()` nên không nhận query instruction. AITeamVN không lưu prompt nên hai role tương đương encode cũ. Không tự prepend prompt vào dữ liệu chunk.
+- Với `dense.multi_gpu: true` và `device: auto|cuda`, build corpus embeddings tự dùng mọi CUDA device nhìn thấy qua Sentence Transformers multi-process; trên Kaggle T4×2 là `cuda:0` và `cuda:1`, mỗi GPU có một model replica và `batch_size` được hiểu trên mỗi GPU. Query/HyDE dense inference vẫn single-GPU vì pipeline xử lý từng text. `multi_process_chunk_size` chỉ là dispatch size; `null` dùng mặc định thư viện.
+- Đổi `model_name`, `revision`, `max_length`, dtype/normalization hoặc FAISS type phải build một index directory mới. Đổi batch/multi-GPU settings không làm index cũ mất hiệu lực. Chỉ đổi dense model không invalidate HyDE JSONL cache; cache phụ thuộc HyDE model/prompt/generation/normalization, không phụ thuộc dense checkpoint.
+- Ngược lại, đổi HyDE 3B → 1.5B không cần build lại BM25/dense index nhưng làm cache namespace đổi hoàn toàn. Dùng file mới như `hyde_vi_qwen2_1_5b.jsonl`; cache 3B là artifact lịch sử, không được tái sử dụng cho run mới.
 - Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Vi-Qwen được ép `use_cache=True`; adapter Qwen2 không truyền `enable_thinking` của Qwen3.
 - Không so sánh/cộng raw BM25, cosine và HyDE score. Từng lane gom chunk về document bằng max score, sau đó fusion rank bằng weighted RRF (`k=60`; weight mặc định 1,0/1,0/0,5).
 - HyDE là dense-only lane. Không chạy BM25 trên đoạn do SLM sinh; reranker chỉ nhận query gốc và chunk thật.
 - Text do HyDE sinh được canonicalize bằng policy versioned `hyde_nfc_ws_v1` tại generator, cache và trước dense retrieval: Unicode NFC; line break/tab thật và literal `\\n`/`\\r`/`\\t`; HTML non-breaking-space allowlist; control/zero-width characters; code fence và whitespace thừa được dọn. Không lowercase, bỏ dấu, sửa punctuation, số hoặc viện dẫn pháp luật. Version nằm trong cache namespace nên cache cũ tự miss thay vì đưa raw hypothesis vào dense lane.
-- Default lấy BM25 top 300 chunks, dense query top 200, dense HyDE top 200, fuse top 50 documents, rerank tối đa 2 evidence chunks/document, output 5 document IDs. Đây là giá trị khởi đầu, chưa được tune trên DSC.
+- Checked-in `default.yaml` hiện lấy BM25 top 300 chunks, dense query top 200, dense HyDE top 200, fuse top 30 documents, rerank tối đa 3 evidence chunks/document, output 5 document IDs. Đây là giá trị đang thử nghiệm, chưa được tune đầy đủ trên DSC.
 - Input contract là JSONL gồm `chunk_id`, `document_id`, `passage`, `retrieval_text` tùy chọn và `metadata`. `retrieval_text` nên ghép metadata title/Điều/Khoản với passage; nếu thiếu thì dùng `passage`.
 - BM25, FAISS và chunk store dùng chung stable row order; manifest kiểm tra hash mapping/nội dung. Output luôn dùng `document_id` dạng chuỗi.
-- CLI hỗ trợ build index, search một query, search cả split, HyDE JSONL cache, diagnostics và các flag `--disable-hyde`, `--disable-reranker` cho ablation.
+- CLI hỗ trợ build index, search một query, search cả split, HyDE JSONL cache, diagnostics và các flag `--disable-hyde`, `--disable-reranker` cho ablation. Batch search có thêm `--deep-diagnostics PATH`: ghi streaming/atomic một JSON riêng chứa toàn bộ BM25, dense và HyDE trước fusion cutoff, gồm canonical chunk ranks/raw scores và document ranks sau MaxP; output thường `diagnostics.json` giữ nguyên schema.
 - Unit test dùng mock backend, kiểm tra document-level RRF, BM25 zero-score padding, HyDE dense-only/cache, evidence grounding, reranker dùng query gốc/chunk thật, mapping chunk→document, config và schema tối đa 5 ID. Lệnh kiểm tra hiện tại:
 
 ```bash
 PYTHONPATH=retrieval/src python -m unittest discover -s retrieval/tests -v
 ```
 
-Sau lần đổi model stack, 23 test đều pass, `compileall` và CLI `--help` smoke-test thành công. Chưa chạy end-to-end model thật vì chưa có dữ liệu chunk; các model/dependency nặng cũng chưa được tải trong workspace. Đọc `retrieval/README.md` trước khi build index.
+Sau khi thêm Harrier adapter và T4×2 support, 52/52 unit tests không tải model/GPU đều pass; `compileall`, CLI `build-index --help`/`search --help` và `git diff --check` cũng pass. Chưa chạy end-to-end model thật vì weights Harrier và dependency nặng chưa được tải trong workspace. Đọc `retrieval/README.md` trước khi build index.
 
-Model card của `Vi-Qwen2-3B-RAG` đang có nội dung/lineage sao chép từ bản 7B dù config và weights là kiến trúc 3B; không dùng benchmark hoặc chuỗi license trong card như bằng chứng chắc chắn nếu chưa xác minh với tác giả. Checkpoint này được fine-tune để trả lời từ context, nên hiệu quả khi dùng làm HyDE generator vẫn là giả thuyết cần ablation, không phải kết luận đã được kiểm chứng.
+Model card/model tree của `Vi-Qwen2-1.5B-RAG` vẫn ghi lineage từ Qwen2-7B-Instruct, nhưng revision pin thực tế có config `Qwen2ForCausalLM`, hidden size 1536, 28 layers, max positions 32768 và đúng 1.543.714.304 params. Không dùng lineage/benchmark trên card làm bằng chứng kiến trúc. Checkpoint được fine-tune cho RAG, nhưng hiệu quả làm HyDE generator vẫn phải ablation trên DSC.
 
 ### Fixed-size preprocessing cho Kaggle
 
@@ -204,6 +210,7 @@ Ngày 2026-08-20 đã thêm `retrieval/src/legal_ir/chunk_fixed_size.py` và con
 - normalize bằng `legal_nfc_ws_v1`: chỉ decode HTML non-breaking-space entity, Unicode NFC, line ending, rồi collapse whitespace/control/invisible characters; không lowercase, bỏ dấu hoặc sửa số/citation;
 - dùng fast tokenizer của `AITeamVN/Vietnamese_Embedding_v2` tại revision đã pin;
 - default 384 content tokens, overlap 64; passage được slice bằng offset trên normalized text;
+- preset Harrier có max length 512 theo tokenizer riêng; không bắt buộc rechunk cho ablation công bằng, nhưng `retrieval_text` gồm title có thể bị truncate và cần đo tỷ lệ truncation;
 - output dự kiến `/kaggle/working/artifacts/chunks/chunk_fixed_size.jsonl` cùng `chunk_fixed_size.manifest.json`;
 - output đúng contract `chunk_id`, `document_id`, `passage`, `retrieval_text`, `metadata`; chunk ID chứa normalization version/size/overlap;
 - skip passage rỗng có ghi manifest, còn JSON/schema/duplicate/mismatch lỗi thì fail-fast;
@@ -219,7 +226,7 @@ Ngày 2026-08-20 đã thêm hai utility chỉ dùng Python standard library:
 - Split được random ở cấp nhóm câu hỏi sau NFC + `casefold` + collapse whitespace. 16 nhóm câu hỏi trùng trong train vì vậy không bị tách qua các split; manifest lưu SHA-256, phân phối số gold documents và thống kê 5 nhóm duplicate có nhãn xung đột. Baseline này chưa stratify theo số gold documents; không nhập warmup vào train mới nếu chưa kiểm tra overlap.
 - `retrieval/src/legal_ir/evaluate_recall_precision.py` cùng entrypoint `legal-ir-evaluate`: tính official macro Recall và macro Precision trên toàn bộ gold queries. Query thiếu được tính như prediction rỗng, query dư được báo/không vào mẫu số, raw answer dài hơn 5 nhận 0/0, duplicate ID được báo là contract invalid.
 - Gold phải có `answer` là list ID chuỗi không rỗng; `IR/public-official.json` có nhãn null nên evaluator chủ động từ chối.
-- 11 unit tests cho hai utility đã pass; sau khi thêm HyDE normalization/cache invariant, toàn bộ suite hiện là 39/39 test, không tải model/GPU. Default split đã được kiểm tra read-only trên dữ liệu thật và cho đúng 5.600/700/700; chưa tạo split artifact thật trong workspace.
+- 11 unit tests ban đầu cho hai utility đã pass; suite tổng hiện còn bao phủ split/evaluator, HyDE normalization/cache, fusion, deep diagnostics và dense adapters mà không tải model/GPU. Default split đã được kiểm tra read-only trên dữ liệu thật và cho đúng 5.600/700/700; chưa tạo split artifact thật trong workspace.
 
 ## Thư mục nghiên cứu phương pháp
 
@@ -245,4 +252,4 @@ Quy ước:
 
 
 ## Lưu ý
-- Mục tiêu chung vẫn là tổng model dưới 4B params và không dùng API trả phí. Ngoại lệ hiện tại chỉ dành cho pipeline Task 1 AITeamVN nói trên: 4,221B params, đã được người dùng chấp nhận rõ ràng ngày 2026-08-20.
+- Mục tiêu chung là tổng model dưới 4B params và không dùng API trả phí. Sau khi đổi HyDE sang Vi-Qwen2-1.5B-RAG, baseline là 2,679B và Harrier ablation là 2,708B; cả hai đều đáp ứng giới hạn.

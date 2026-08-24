@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TextIO
 
-from .schema import Chunk, SearchResponse
+from .schema import Chunk, DeepQueryDiagnostics, SearchResponse
 
 
 class ChunkStore:
@@ -101,3 +103,108 @@ def write_diagnostics(
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
 
+
+class DeepDiagnosticsWriter:
+    """Stream full retrieval traces and atomically publish one JSON object."""
+
+    FORMAT_VERSION = 1
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        pipeline_config: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.destination = Path(path)
+        self.pipeline_config = dict(pipeline_config or {})
+        self._handle: TextIO | None = None
+        self._temporary_path: Path | None = None
+        self._query_ids: set[str] = set()
+        self._first_query = True
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+    def __enter__(self) -> "DeepDiagnosticsWriter":
+        if self._handle is not None:
+            raise RuntimeError("deep diagnostics writer is already open")
+        header = {
+            "format_version": self.FORMAT_VERSION,
+            "pipeline_config": self.pipeline_config,
+        }
+        serialized_header = self._json(header)
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self.destination.parent,
+            prefix=f".{self.destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        self._handle = handle
+        self._temporary_path = Path(handle.name)
+        self._query_ids.clear()
+        self._first_query = True
+        try:
+            # Remove the closing brace so query records can be streamed one at a time.
+            handle.write(serialized_header[:-1])
+            handle.write(',"queries":{')
+        except BaseException:
+            self._abort()
+            raise
+        return self
+
+    def write(self, query_id: str, diagnostics: DeepQueryDiagnostics) -> None:
+        if self._handle is None:
+            raise RuntimeError("deep diagnostics writer is not open")
+        normalized_query_id = str(query_id)
+        if normalized_query_id in self._query_ids:
+            raise ValueError(f"duplicate deep diagnostics query_id: {normalized_query_id}")
+
+        # Serialize before touching the stream so invalid values cannot leave a
+        # half-written query record. Canonical ranking has already removed NaN/Inf.
+        record = (
+            self._json(normalized_query_id)
+            + ":"
+            + self._json(diagnostics.to_dict())
+        )
+        if not self._first_query:
+            self._handle.write(",")
+        self._handle.write(record)
+        self._query_ids.add(normalized_query_id)
+        self._first_query = False
+
+    def _abort(self) -> None:
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        if self._temporary_path is not None:
+            self._temporary_path.unlink(missing_ok=True)
+        self._handle = None
+        self._temporary_path = None
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if self._handle is None or self._temporary_path is None:
+            return False
+        if exc_type is not None:
+            self._abort()
+            return False
+
+        try:
+            self._handle.write("}}\n")
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._handle.close()
+            os.replace(self._temporary_path, self.destination)
+        except BaseException:
+            self._abort()
+            raise
+        self._handle = None
+        self._temporary_path = None
+        return False

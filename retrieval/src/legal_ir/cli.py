@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import replace
+from contextlib import nullcontext
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -14,7 +15,12 @@ from .hyde import (
     hyde_cache_namespace,
 )
 from .indexing import build_indexes, load_indexes
-from .io import load_questions, write_diagnostics, write_submission
+from .io import (
+    DeepDiagnosticsWriter,
+    load_questions,
+    write_diagnostics,
+    write_submission,
+)
 from .pipeline import RetrievalPipeline
 from .reranker import VietnameseCrossEncoderReranker
 
@@ -75,15 +81,48 @@ def _build_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_search_output_paths(args: argparse.Namespace) -> None:
+    paths = [("output", Path(args.output))]
+    if args.diagnostics:
+        paths.append(("diagnostics", Path(args.diagnostics)))
+    if getattr(args, "deep_diagnostics", None):
+        paths.append(("deep-diagnostics", Path(args.deep_diagnostics)))
+
+    seen: dict[Path, str] = {}
+    for label, path in paths:
+        resolved = path.expanduser().resolve(strict=False)
+        previous = seen.get(resolved)
+        if previous is not None:
+            raise ValueError(
+                f"--{label} and --{previous} must use different output paths"
+            )
+        seen[resolved] = label
+
+
 def _search_command(args: argparse.Namespace) -> int:
+    _validate_search_output_paths(args)
     config = _runtime_config(args)
     pipeline = _pipeline(args, config)
     questions = load_questions(args.queries)
     responses = {}
-    for position, (query_id, question) in enumerate(questions.items(), start=1):
-        responses[query_id] = pipeline.search(question)
-        if position == 1 or position % 10 == 0 or position == len(questions):
-            LOGGER.info("Retrieved %d/%d queries", position, len(questions))
+    deep_path = getattr(args, "deep_diagnostics", None)
+    writer_context = (
+        DeepDiagnosticsWriter(deep_path, pipeline_config=asdict(config))
+        if deep_path
+        else nullcontext(None)
+    )
+    with writer_context as deep_writer:
+        for position, (query_id, question) in enumerate(questions.items(), start=1):
+            if deep_writer is None:
+                response = pipeline.search(question)
+            else:
+                response, deep_diagnostics = (
+                    pipeline.search_with_deep_diagnostics(question)
+                )
+                deep_writer.write(query_id, deep_diagnostics)
+            responses[query_id] = response
+            if position == 1 or position % 10 == 0 or position == len(questions):
+                LOGGER.info("Retrieved %d/%d queries", position, len(questions))
     write_submission(responses, args.output)
     if args.diagnostics:
         write_diagnostics(responses, args.diagnostics)
@@ -129,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--queries", required=True, type=Path)
     search.add_argument("--output", required=True, type=Path)
     search.add_argument("--diagnostics", type=Path)
+    search.add_argument(
+        "--deep-diagnostics",
+        type=Path,
+        help="optional full pre-fusion BM25/dense/HyDE trace JSON",
+    )
     search.set_defaults(handler=_search_command)
 
     one = subparsers.add_parser("search-one", help="retrieve one query")

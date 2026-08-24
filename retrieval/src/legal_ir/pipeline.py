@@ -4,15 +4,23 @@ import math
 from collections.abc import Sequence
 
 from .config import PipelineConfig
-from .fusion import weighted_rrf
+from .fusion import fuse_ranked_channels, rank_channels, rank_documents
 from .hyde import normalize_hyde_text
 from .interfaces import (
     ChunkRetriever,
+    DenseChunkRetriever,
     HypotheticalDocumentGenerator,
     PassageReranker,
 )
 from .io import ChunkStore
-from .schema import DocumentCandidate, ScoredChunk, SearchResponse, SearchResult
+from .schema import (
+    DeepQueryDiagnostics,
+    DocumentCandidate,
+    RetrievalChannelDiagnostics,
+    ScoredChunk,
+    SearchResponse,
+    SearchResult,
+)
 
 
 class RetrievalPipeline:
@@ -23,7 +31,7 @@ class RetrievalPipeline:
         *,
         chunks: ChunkStore,
         bm25: ChunkRetriever,
-        dense: ChunkRetriever,
+        dense: DenseChunkRetriever,
         config: PipelineConfig,
         hyde_generator: HypotheticalDocumentGenerator | None = None,
         reranker: PassageReranker | None = None,
@@ -110,7 +118,9 @@ class RetrievalPipeline:
             evidence_rerank_scores=dict(candidate.evidence_rerank_scores),
         )
 
-    def search(self, query: str) -> SearchResponse:
+    def _search(
+        self, query: str, *, capture_deep_diagnostics: bool
+    ) -> tuple[SearchResponse, DeepQueryDiagnostics | None]:
         query = query.strip()
         if not query:
             raise ValueError("query must not be empty")
@@ -125,6 +135,10 @@ class RetrievalPipeline:
             "bm25": bm25_hits,
             "dense": dense_hits,
         }
+        channel_search: dict[str, tuple[str, str, int]] = {
+            "bm25": ("query", query, self.config.bm25.top_k_chunks),
+            "dense": ("query", query, self.config.dense.top_k_chunks),
+        }
 
         hypothesis: str | None = None
         if self.config.hyde.enabled:
@@ -135,11 +149,38 @@ class RetrievalPipeline:
             # HyDE is intentionally a dense-only lane: never BM25 the hallucination.
             channels["hyde"] = self._validate_hits(
                 "hyde",
-                self.dense.search(hypothesis, self.config.hyde.top_k_chunks),
+                self.dense.search(
+                    hypothesis,
+                    self.config.hyde.top_k_chunks,
+                    input_type="document",
+                ),
+            )
+            channel_search["hyde"] = (
+                "hypothetical_document",
+                hypothesis,
+                self.config.hyde.top_k_chunks,
             )
 
-        candidates = weighted_rrf(
-            channels,
+        ranked_channels = rank_channels(channels)
+        deep_diagnostics: DeepQueryDiagnostics | None = None
+        if capture_deep_diagnostics:
+            deep_diagnostics = DeepQueryDiagnostics(
+                query=query,
+                hypothetical_document=hypothesis,
+                channels={
+                    channel: RetrievalChannelDiagnostics(
+                        search_text=channel_search[channel][1],
+                        search_text_source=channel_search[channel][0],
+                        requested_top_k_chunks=channel_search[channel][2],
+                        chunk_hits=tuple(hits),
+                        document_hits=tuple(rank_documents(hits)),
+                    )
+                    for channel, hits in ranked_channels.items()
+                },
+            )
+
+        candidates = fuse_ranked_channels(
+            ranked_channels,
             channel_weights=self.config.fusion.channel_weights,
             rrf_k=self.config.fusion.rrf_k,
             top_k_documents=self.config.fusion.candidate_documents,
@@ -150,11 +191,31 @@ class RetrievalPipeline:
         candidates = candidates[: self.config.reranker.final_top_k_documents]
 
         results = tuple(self._to_result(candidate) for candidate in candidates)
-        return SearchResponse(
-            query=query,
-            results=results,
-            hypothetical_document=hypothesis,
-            fused_candidates=tuple(
-                self._to_result(candidate) for candidate in fused_candidates
+        return (
+            SearchResponse(
+                query=query,
+                results=results,
+                hypothetical_document=hypothesis,
+                fused_candidates=tuple(
+                    self._to_result(candidate) for candidate in fused_candidates
+                ),
             ),
+            deep_diagnostics,
         )
+
+    def search(self, query: str) -> SearchResponse:
+        """Run retrieval without retaining the full pre-fusion trace."""
+
+        response, _ = self._search(query, capture_deep_diagnostics=False)
+        return response
+
+    def search_with_deep_diagnostics(
+        self, query: str
+    ) -> tuple[SearchResponse, DeepQueryDiagnostics]:
+        """Run retrieval once and also return every canonical channel hit."""
+
+        response, diagnostics = self._search(
+            query, capture_deep_diagnostics=True
+        )
+        assert diagnostics is not None
+        return response, diagnostics

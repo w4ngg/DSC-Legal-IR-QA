@@ -52,7 +52,7 @@ class FixedSizeChunkingConfig:
     tokenizer_revision: str | None = DEFAULT_TOKENIZER_REVISION
     tokenizer_cache_dir: Path | None = None
     local_files_only: bool = False
-    chunk_size_tokens: int = 384
+    chunk_size_tokens: int = 320
     overlap_tokens: int = 64
     input_pattern: str = "context_*.json"
     include_document_title: bool = True

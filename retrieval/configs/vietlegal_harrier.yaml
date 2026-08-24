@@ -1,4 +1,4 @@
-# Đây là baseline ưu tiên recall. Các top-k cần được tune trên validation sạch.
+# VietLegal-Harrier dense ablation. Build a new index directory for this config.
 bm25:
   method: lucene
   k1: 1.2
@@ -6,20 +6,18 @@ bm25:
   top_k_chunks: 300
   mmap: true
 
-# AITeamVN baseline. For Harrier use configs/vietlegal_harrier.yaml or replace
-# model_name/revision/max_length with the values from that preset.
 dense:
-  model_name: AITeamVN/Vietnamese_Embedding_v2
-  revision: 18b44161e041bf1d3a333ab5144b5b7b93f914d2
+  model_name: mainguyen9/vietlegal-harrier-0.6b
+  revision: 91a0e1ebe4b63b4475bbae40658b8ca9231bea74
   top_k_chunks: 200
-  batch_size: 32
-  max_length: 2048
+  # Per GPU. Start conservatively on T4, then raise after measuring VRAM.
+  batch_size: 16
+  # The checkpoint was trained and published with a 512-token ST limit.
+  max_length: 512
   device: auto
   dtype: auto
   normalize_embeddings: true
-  # Build corpus embeddings on every visible CUDA GPU; query search stays single-GPU.
   multi_gpu: true
-  # Number of texts dispatched to a worker at once; null lets SentenceTransformers tune it.
   multi_process_chunk_size: null
   index_type: flat
   hnsw_m: 32

@@ -5,12 +5,46 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from legal_ir.cli import build_parser
 from legal_ir.config import PipelineConfig
-from legal_ir.io import ChunkStore, load_questions, write_submission
-from legal_ir.schema import Chunk, SearchResponse, SearchResult
+from legal_ir.io import (
+    ChunkStore,
+    DeepDiagnosticsWriter,
+    load_questions,
+    write_submission,
+)
+from legal_ir.schema import (
+    Chunk,
+    DeepQueryDiagnostics,
+    RankedChunk,
+    RankedDocument,
+    RetrievalChannelDiagnostics,
+    SearchResponse,
+    SearchResult,
+)
 
 
 class IOAndConfigTest(unittest.TestCase):
+    @staticmethod
+    def _deep_query() -> DeepQueryDiagnostics:
+        return DeepQueryDiagnostics(
+            query="Điều kiện cấp phép?",
+            hypothetical_document="Quy định giả định",
+            channels={
+                "bm25": RetrievalChannelDiagnostics(
+                    search_text="Điều kiện cấp phép?",
+                    search_text_source="query",
+                    requested_top_k_chunks=300,
+                    chunk_hits=(
+                        RankedChunk("c-1", "21", 12.5, 1, "bm25"),
+                    ),
+                    document_hits=(
+                        RankedDocument("21", 12.5, 1, "c-1", 1),
+                    ),
+                )
+            },
+        )
+
     def test_chunk_ids_and_document_ids_are_normalized_to_strings(self) -> None:
         chunk = Chunk.from_dict(
             {
@@ -89,6 +123,69 @@ class IOAndConfigTest(unittest.TestCase):
                     },
                 }
             )
+
+    def test_dense_multi_gpu_config_is_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "multi_gpu must be a boolean"):
+            PipelineConfig.from_mapping({"dense": {"multi_gpu": "auto"}})
+        for invalid in (0, -1, 1.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    PipelineConfig.from_mapping(
+                        {"dense": {"multi_process_chunk_size": invalid}}
+                    )
+
+    def test_deep_diagnostics_writer_streams_valid_unicode_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "nested" / "deep_diag.json"
+            with DeepDiagnosticsWriter(
+                destination,
+                pipeline_config={"hyde": {"enabled": True}},
+            ) as writer:
+                writer.write(84238, self._deep_query())
+
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(payload["format_version"], 1)
+            self.assertTrue(payload["pipeline_config"]["hyde"]["enabled"])
+            query = payload["queries"]["84238"]
+            self.assertEqual(query["query"], "Điều kiện cấp phép?")
+            self.assertEqual(
+                query["channels"]["bm25"]["chunk_hits"][0]["chunk_id"],
+                "c-1",
+            )
+            self.assertTrue(destination.read_bytes().endswith(b"\n"))
+
+    def test_deep_diagnostics_failure_preserves_previous_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "deep_diag.json"
+            destination.write_text("previous output\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                with DeepDiagnosticsWriter(destination) as writer:
+                    writer.write("q1", self._deep_query())
+                    raise RuntimeError("interrupted")
+
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"), "previous output\n"
+            )
+            self.assertEqual(list(destination.parent.glob(".deep_diag.json.*.tmp")), [])
+
+    def test_search_parser_accepts_separate_deep_diagnostics_output(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "search",
+                "--queries",
+                "queries.json",
+                "--index-dir",
+                "index",
+                "--output",
+                "submission.json",
+                "--deep-diagnostics",
+                "deep_diag.json",
+            ]
+        )
+
+        self.assertEqual(args.deep_diagnostics, Path("deep_diag.json"))
+        self.assertIsNone(args.diagnostics)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from legal_ir.config import PipelineConfig
 from legal_ir.indexing import _chunk_records_hash, load_indexes
@@ -83,6 +84,42 @@ class IndexManifestTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "records or ordering"):
                 load_indexes(root, config)
+
+    def test_runtime_batch_and_multi_gpu_settings_do_not_invalidate_index(self) -> None:
+        built_config = PipelineConfig()
+        runtime_config = replace(
+            built_config,
+            dense=replace(
+                built_config.dense,
+                batch_size=17,
+                multi_gpu=False,
+                multi_process_chunk_size=511,
+            ),
+        )
+        chunks = ChunkStore([Chunk("c1", "21", "nội dung")])
+        bm25_backend = object()
+        dense_backend = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chunks.save_jsonl(root / "chunks.jsonl")
+            (root / "manifest.json").write_text(
+                json.dumps(_manifest(built_config, chunks)), encoding="utf-8"
+            )
+
+            with (
+                patch(
+                    "legal_ir.indexing.BM25Index.load",
+                    return_value=bm25_backend,
+                ),
+                patch(
+                    "legal_ir.indexing.FaissDenseIndex.load",
+                    return_value=dense_backend,
+                ),
+            ):
+                bundle = load_indexes(root, runtime_config)
+
+        self.assertIs(bundle.bm25, bm25_backend)
+        self.assertIs(bundle.dense, dense_backend)
 
 
 if __name__ == "__main__":

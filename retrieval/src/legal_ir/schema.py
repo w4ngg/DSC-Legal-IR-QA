@@ -81,6 +81,75 @@ class RankedChunk:
     channel: str
 
 
+@dataclass(frozen=True, slots=True)
+class RankedDocument:
+    """One channel's MaxP document result and its strongest source chunk."""
+
+    document_id: str
+    score: float
+    rank: int
+    best_chunk_id: str
+    best_chunk_rank: int
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalChannelDiagnostics:
+    """Canonical results from one retrieval lane, before document fusion."""
+
+    search_text: str
+    search_text_source: str
+    requested_top_k_chunks: int
+    chunk_hits: tuple[RankedChunk, ...]
+    document_hits: tuple[RankedDocument, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "search_text": self.search_text,
+            "search_text_source": self.search_text_source,
+            "requested_top_k_chunks": self.requested_top_k_chunks,
+            "returned_chunk_count": len(self.chunk_hits),
+            "returned_document_count": len(self.document_hits),
+            "chunk_hits": [
+                {
+                    "rank": hit.rank,
+                    "chunk_id": hit.chunk_id,
+                    "document_id": hit.document_id,
+                    "score": hit.score,
+                }
+                for hit in self.chunk_hits
+            ],
+            "document_hits": [
+                {
+                    "rank": hit.rank,
+                    "document_id": hit.document_id,
+                    "score": hit.score,
+                    "best_chunk_id": hit.best_chunk_id,
+                    "best_chunk_rank": hit.best_chunk_rank,
+                }
+                for hit in self.document_hits
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DeepQueryDiagnostics:
+    """Full pre-fusion retrieval trace for one query."""
+
+    query: str
+    hypothetical_document: str | None
+    channels: Mapping[str, RetrievalChannelDiagnostics]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "hypothetical_document": self.hypothetical_document,
+            "channels": {
+                channel: diagnostics.to_dict()
+                for channel, diagnostics in self.channels.items()
+            },
+        }
+
+
 @dataclass(slots=True)
 class DocumentCandidate:
     document_id: str

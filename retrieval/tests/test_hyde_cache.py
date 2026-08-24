@@ -31,6 +31,10 @@ class HyDECacheTest(unittest.TestCase):
             hyde_cache_namespace(base),
             hyde_cache_namespace(replace(base, revision="another-revision")),
         )
+        self.assertNotEqual(
+            hyde_cache_namespace(base),
+            hyde_cache_namespace(replace(base, model_name="another/hyde-model")),
+        )
 
     def test_normalizer_version_change_invalidates_namespace(self) -> None:
         config = HyDEConfig()

@@ -2,17 +2,9 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from .schema import DocumentCandidate, RankedChunk, ScoredChunk
-
-
-@dataclass(frozen=True, slots=True)
-class _RankedDocument:
-    document_id: str
-    score: float
-    rank: int
+from .schema import DocumentCandidate, RankedChunk, RankedDocument, ScoredChunk
 
 
 def rank_chunks(channel: str, hits: Sequence[ScoredChunk]) -> list[RankedChunk]:
@@ -41,23 +33,42 @@ def rank_chunks(channel: str, hits: Sequence[ScoredChunk]) -> list[RankedChunk]:
     ]
 
 
-def _rank_documents(hits: Sequence[RankedChunk]) -> list[_RankedDocument]:
+def rank_documents(hits: Sequence[RankedChunk]) -> list[RankedDocument]:
     """MaxP aggregation inside one channel, before rank fusion."""
 
-    max_score: dict[str, float] = {}
+    best_hit: dict[str, RankedChunk] = {}
     for hit in hits:
-        current = max_score.get(hit.document_id)
-        if current is None or hit.score > current:
-            max_score[hit.document_id] = hit.score
-    ordered = sorted(max_score.items(), key=lambda item: (-item[1], item[0]))
+        current = best_hit.get(hit.document_id)
+        if current is None or hit.score > current.score:
+            best_hit[hit.document_id] = hit
+    ordered = sorted(
+        best_hit.items(),
+        key=lambda item: (-item[1].score, item[0]),
+    )
     return [
-        _RankedDocument(document_id=document_id, score=score, rank=rank)
-        for rank, (document_id, score) in enumerate(ordered, start=1)
+        RankedDocument(
+            document_id=document_id,
+            score=hit.score,
+            rank=rank,
+            best_chunk_id=hit.chunk_id,
+            best_chunk_rank=hit.rank,
+        )
+        for rank, (document_id, hit) in enumerate(ordered, start=1)
     ]
 
 
-def weighted_rrf(
+def rank_channels(
     channel_hits: Mapping[str, Sequence[ScoredChunk]],
+) -> dict[str, list[RankedChunk]]:
+    """Canonicalize every retrieval lane exactly once."""
+
+    return {
+        channel: rank_chunks(channel, hits) for channel, hits in channel_hits.items()
+    }
+
+
+def fuse_ranked_channels(
+    ranked_chunks: Mapping[str, Sequence[RankedChunk]],
     *,
     channel_weights: Mapping[str, float],
     rrf_k: int,
@@ -65,18 +76,15 @@ def weighted_rrf(
     evidence_chunks_per_document: int,
     grounded_channels: frozenset[str] = frozenset({"bm25", "dense"}),
 ) -> list[DocumentCandidate]:
-    """Fuse incomparable scores by ranks after chunk-to-document aggregation."""
+    """Fuse already-canonicalized channels with document-level weighted RRF."""
 
-    ranked_chunks = {
-        channel: rank_chunks(channel, hits) for channel, hits in channel_hits.items()
-    }
     candidates: dict[str, DocumentCandidate] = {}
 
     for channel, hits in ranked_chunks.items():
         weight = float(channel_weights.get(channel, 0.0))
         if weight <= 0:
             continue
-        for document in _rank_documents(hits):
+        for document in rank_documents(hits):
             candidate = candidates.setdefault(
                 document.document_id,
                 DocumentCandidate(document_id=document.document_id, fusion_score=0.0),
@@ -131,3 +139,24 @@ def weighted_rrf(
                 selected.append(chunk_id)
         candidate.evidence_chunk_ids = selected
     return ordered
+
+
+def weighted_rrf(
+    channel_hits: Mapping[str, Sequence[ScoredChunk]],
+    *,
+    channel_weights: Mapping[str, float],
+    rrf_k: int,
+    top_k_documents: int,
+    evidence_chunks_per_document: int,
+    grounded_channels: frozenset[str] = frozenset({"bm25", "dense"}),
+) -> list[DocumentCandidate]:
+    """Fuse incomparable scores by ranks after chunk-to-document aggregation."""
+
+    return fuse_ranked_channels(
+        rank_channels(channel_hits),
+        channel_weights=channel_weights,
+        rrf_k=rrf_k,
+        top_k_documents=top_k_documents,
+        evidence_chunks_per_document=evidence_chunks_per_document,
+        grounded_channels=grounded_channels,
+    )

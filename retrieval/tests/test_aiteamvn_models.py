@@ -14,7 +14,8 @@ from legal_ir.reranker import VietnameseCrossEncoderReranker
 
 
 EMBEDDING_REVISION = "18b44161e041bf1d3a333ab5144b5b7b93f914d2"
-HYDE_REVISION = "eaf427c24d86066a2b35828c499b7db3af321227"
+HARRIER_REVISION = "91a0e1ebe4b63b4475bbae40658b8ca9231bea74"
+HYDE_REVISION = "c8272ce4ad08da4cc27b4bda59faabc66caedf07"
 RERANKER_REVISION = "f536976248403314225d7fdfdbc87f0e9516a54e"
 
 
@@ -28,7 +29,7 @@ class AITeamVNConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             (config.hyde.model_name, config.hyde.revision),
-            ("AITeamVN/Vi-Qwen2-3B-RAG", HYDE_REVISION),
+            ("AITeamVN/Vi-Qwen2-1.5B-RAG", HYDE_REVISION),
         )
         self.assertEqual(
             (config.reranker.model_name, config.reranker.revision),
@@ -48,11 +49,33 @@ class AITeamVNConfigTest(unittest.TestCase):
                 self.assertIn(f"  model_name: {expected.model_name}\n", section)
                 self.assertIn(f"  revision: {expected.revision}\n", section)
 
+    def test_harrier_preset_pins_checkpoint_and_native_length(self) -> None:
+        config_path = (
+            Path(__file__).parents[1] / "configs" / "vietlegal_harrier.yaml"
+        )
+
+        yaml_text = config_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "  model_name: mainguyen9/vietlegal-harrier-0.6b\n", yaml_text
+        )
+        self.assertIn(f"  revision: {HARRIER_REVISION}\n", yaml_text)
+        self.assertIn("  max_length: 512\n", yaml_text)
+        self.assertIn("  normalize_embeddings: true\n", yaml_text)
+        self.assertIn("  multi_gpu: true\n", yaml_text)
+        hyde_section = yaml_text.split("hyde:\n", maxsplit=1)[1]
+        hyde_section = hyde_section.split("\n\n", maxsplit=1)[0]
+        self.assertIn(
+            "  model_name: AITeamVN/Vi-Qwen2-1.5B-RAG\n", hyde_section
+        )
+        self.assertIn(f"  revision: {HYDE_REVISION}\n", hyde_section)
+
 
 class AITeamVNEmbeddingTest(unittest.TestCase):
-    def test_encode_requests_unit_normalized_embeddings(self) -> None:
+    def test_ir_roles_request_normalized_query_and_document_embeddings(self) -> None:
         model = Mock()
-        model.encode.return_value = [[1.0, 0.0]]
+        model.encode_query.return_value = [[1.0, 0.0]]
+        model.encode_document.return_value = [[0.0, 1.0]]
         config = DenseConfig(
             model_name="AITeamVN/Vietnamese_Embedding_v2",
             revision=EMBEDDING_REVISION,
@@ -61,16 +84,139 @@ class AITeamVNEmbeddingTest(unittest.TestCase):
         encoder = VietnameseEmbeddingEncoder(config)
         encoder._model = model
 
-        encoded = encoder.encode(["Điều kiện cấp giấy phép là gì?"])
+        with (
+            patch.object(encoder, "_single_device", return_value="cuda"),
+            patch.object(
+                encoder,
+                "_document_devices",
+                return_value="cuda",
+            ),
+        ):
+            query_encoded = encoder.encode_queries(
+                ["Điều kiện cấp giấy phép là gì?"]
+            )
+            document_encoded = encoder.encode_documents(["Điều 3. Điều kiện..."])
 
-        self.assertEqual(encoded, [[1.0, 0.0]])
-        model.encode.assert_called_once_with(
+        self.assertEqual(query_encoded, [[1.0, 0.0]])
+        self.assertEqual(document_encoded, [[0.0, 1.0]])
+        model.encode_query.assert_called_once_with(
             ["Điều kiện cấp giấy phép là gì?"],
+            device="cuda",
             batch_size=config.batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
+        model.encode_document.assert_called_once_with(
+            ["Điều 3. Điều kiện..."],
+            device="cuda",
+            chunk_size=None,
+            batch_size=config.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        model.encode.assert_not_called()
+
+    def test_document_encoding_uses_both_visible_cuda_devices(self) -> None:
+        model = Mock()
+        model.encode_document.return_value = [[1.0, 0.0], [0.0, 1.0]]
+        config = DenseConfig(
+            batch_size=16,
+            multi_gpu=True,
+            multi_process_chunk_size=512,
+        )
+        encoder = VietnameseEmbeddingEncoder(config)
+        encoder._model = model
+
+        with (
+            patch.object(
+                encoder,
+                "_document_devices",
+                return_value=["cuda:0", "cuda:1"],
+            ),
+            patch.object(encoder, "_load", return_value=model) as load,
+        ):
+            encoded = encoder.encode_documents(
+                ["đoạn A", "đoạn B"],
+                use_multi_gpu=True,
+            )
+
+        self.assertEqual(encoded, [[1.0, 0.0], [0.0, 1.0]])
+        load.assert_called_once_with(initial_device="cpu")
+        model.encode_document.assert_called_once_with(
+            ["đoạn A", "đoạn B"],
+            device=["cuda:0", "cuda:1"],
+            chunk_size=512,
+            batch_size=16,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        self.assertIsNone(encoder._model)
+
+    def test_multi_gpu_parent_is_cleared_when_worker_encoding_fails(self) -> None:
+        model = Mock()
+        model.encode_document.side_effect = RuntimeError("worker failed")
+        encoder = VietnameseEmbeddingEncoder(DenseConfig(multi_gpu=True))
+
+        with (
+            patch.object(
+                encoder,
+                "_document_devices",
+                return_value=["cuda:0", "cuda:1"],
+            ),
+            patch.object(encoder, "_load", return_value=model),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "worker failed"):
+                encoder.encode_documents(["đoạn A"], use_multi_gpu=True)
+
+        self.assertIsNone(encoder._model)
+
+    def test_multi_gpu_auto_detection_is_corpus_only(self) -> None:
+        fake_torch = Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.device_count.return_value = 2
+        config = DenseConfig(device="auto", multi_gpu=True)
+        encoder = VietnameseEmbeddingEncoder(config)
+
+        with patch.object(encoder, "_torch", return_value=fake_torch):
+            self.assertEqual(
+                encoder._document_devices(use_multi_gpu=True),
+                ["cuda:0", "cuda:1"],
+            )
+            self.assertEqual(
+                encoder._document_devices(use_multi_gpu=False),
+                "cuda",
+            )
+            self.assertEqual(encoder._single_device(), "cuda")
+
+    def test_explicit_device_disables_automatic_multi_gpu(self) -> None:
+        fake_torch = Mock()
+        fake_torch.cuda.device_count.return_value = 2
+        encoder = VietnameseEmbeddingEncoder(
+            DenseConfig(device="cuda:1", multi_gpu=True)
+        )
+
+        with patch.object(encoder, "_torch", return_value=fake_torch):
+            self.assertEqual(
+                encoder._document_devices(use_multi_gpu=True),
+                "cuda:1",
+            )
+
+    def test_one_visible_cuda_device_falls_back_to_single_process(self) -> None:
+        fake_torch = Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.device_count.return_value = 1
+        encoder = VietnameseEmbeddingEncoder(
+            DenseConfig(device="auto", multi_gpu=True)
+        )
+
+        with patch.object(encoder, "_torch", return_value=fake_torch):
+            self.assertEqual(
+                encoder._document_devices(use_multi_gpu=True),
+                "cuda",
+            )
 
 
 class AITeamVNRerankerTest(unittest.TestCase):
@@ -221,7 +367,7 @@ class AITeamVNHyDETest(unittest.TestCase):
 
     def test_qwen2_prompt_is_deterministic_and_generation_uses_kv_cache(self) -> None:
         config = HyDEConfig(
-            model_name="AITeamVN/Vi-Qwen2-3B-RAG",
+            model_name="AITeamVN/Vi-Qwen2-1.5B-RAG",
             revision=HYDE_REVISION,
             max_new_tokens=123,
             do_sample=False,

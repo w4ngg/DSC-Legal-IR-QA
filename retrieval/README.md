@@ -6,10 +6,10 @@ Pipeline mặc định:
 
 ```text
 BM25(query) ──────────────────────────┐
-Vietnamese_Embedding_v2(query) ───────┼─ MaxP chunk→document
-Vi-Qwen2-3B-RAG → HyDE → dense(HyDE) ─┘          ↓
+Dense SentenceTransformer(query) ─────┼─ MaxP chunk→document
+Vi-Qwen2-1.5B-RAG → HyDE → dense(HyDE) ─┘          ↓
                                       weighted document-level RRF
-                                                   ↓ top 50 documents
+                                                   ↓ top-K documents
                                Vietnamese_Reranker(query, real chunks)
                                                    ↓
                                            tối đa 5 document IDs
@@ -20,17 +20,18 @@ Các nguyên tắc đã được khóa trong implementation và unit test:
 - Không cộng hoặc so sánh trực tiếp raw score của BM25, cosine và HyDE.
 - Mỗi lane gom chunk về document bằng MaxP rồi mới dùng weighted RRF.
 - HyDE chỉ chạy qua dense retrieval; BM25 luôn dùng câu hỏi thật.
+- Dense adapter tách đúng vai trò: câu hỏi thật dùng `encode_query()`, corpus và hypothetical passage dùng `encode_document()`. Vì vậy model có query instruction như VietLegal-Harrier được áp dụng prompt đúng chỗ mà không làm nhiễm corpus/HyDE.
 - Output HyDE được chuẩn hóa trước khi vào dense search và diagnostics: Unicode NFC, xuống dòng/control/invisible characters, literal `\\n`/`\\r`/`\\t`, code fence và khoảng trắng thừa được collapse; chữ hoa/thường, dấu tiếng Việt, số, dấu câu và viện dẫn pháp luật được giữ nguyên.
 - Reranker luôn dùng câu hỏi gốc và `retrieval_text` của chunk thật, không dùng hypothetical document.
 - Trong các evidence đưa vào reranker, code giữ ít nhất một chunk do query gốc tìm được nếu document có chunk như vậy; HyDE không được chiếm toàn bộ evidence slots.
 - Output được deduplicate ở cấp document và bị giới hạn tối đa 5 ID.
 - Có thể tắt riêng HyDE/reranker để chạy ablation.
 
-Model mặc định là `AITeamVN/Vietnamese_Embedding_v2` (567.754.752), `AITeamVN/Vietnamese_Reranker` (567.755.777) và `AITeamVN/Vi-Qwen2-3B-RAG` (3.085.938.688 tham số). Tổng checkpoint duy nhất là **4.221.449.217 tham số**; đây là sai số 5,54% so với giới hạn 4B đã được chấp nhận cho thí nghiệm này. Các revision đầy đủ được pin trong cả dataclass và YAML để index/query không vô tình dùng hai phiên bản weights khác nhau. Quantization chỉ giảm VRAM, không thay đổi số tham số.
+Model mặc định là `AITeamVN/Vietnamese_Embedding_v2` (567.754.752), `AITeamVN/Vietnamese_Reranker` (567.755.777) và `AITeamVN/Vi-Qwen2-1.5B-RAG` (1.543.714.304 tham số). Tổng checkpoint duy nhất là **2.679.224.833 tham số**, nằm dưới giới hạn 4B. Preset thay dense bằng `mainguyen9/vietlegal-harrier-0.6b` (596.049.920 tham số) có tổng **2.707.520.001**, cũng dưới 4B. Các revision đầy đủ được pin trong YAML để runtime/cache không vô tình dùng phiên bản weights khác. Quantization chỉ giảm VRAM, không thay đổi số tham số.
 
-`Vietnamese_Embedding_v2` tạo vector 1024 chiều bằng CLS pooling rồi normalize; FAISS vì vậy dùng inner product tương đương cosine. `Vietnamese_Reranker` là cross-encoder `XLMRobertaForSequenceClassification` với một raw logit cho mỗi cặp query–passage. Code dùng `CrossEncoder` với Identity activation; không dùng checkpoint reranker như một bi-encoder dù snippet tự sinh ở đầu trang Hugging Face có thể gây hiểu nhầm.
+`Vietnamese_Embedding_v2` tạo vector 1024 chiều bằng CLS pooling rồi normalize. `vietlegal-harrier-0.6b` cũng tạo vector 1024 chiều đã normalize nhưng dùng Qwen3 backbone, last-token pooling và query instruction dành cho luật Việt Nam. FAISS dùng inner product, tương đương cosine khi vector đã normalize. `Vietnamese_Reranker` là cross-encoder `XLMRobertaForSequenceClassification` với một raw logit cho mỗi cặp query–passage. Code dùng `CrossEncoder` với Identity activation; không dùng checkpoint reranker như một bi-encoder dù snippet tự sinh ở đầu trang Hugging Face có thể gây hiểu nhầm.
 
-Giới hạn mặc định bám theo model card: dense tối đa 2048 token và reranker tối đa 2304 token cho cả cặp query–passage. `batch_size` 8/4 chỉ là điểm khởi đầu; giảm xuống 4/1–2 nếu chunk dài hoặc GPU ít VRAM.
+Giới hạn mặc định bám theo model card: `Vietnamese_Embedding_v2` tối đa 2048 token, Harrier tối đa 512 token và reranker tối đa 2304 token cho cả cặp query–passage. Baseline dùng dense batch 32, preset Harrier bắt đầu ở 16; đây là kích thước **trên mỗi GPU**, không phải tổng của hai GPU. Có thể tăng dần sau khi đo VRAM hoặc giảm còn 8 nếu Harrier OOM. Reranker mặc định dùng batch 4.
 
 ## 1. Chuẩn dữ liệu chunk đầu vào
 
@@ -71,9 +72,11 @@ source .venv/bin/activate
 pip install -e "./retrieval[dev]"
 ```
 
-Model sẽ được tải từ Hugging Face ở lần chạy thật đầu tiên. Cấu hình yêu cầu Python 3.10+, `transformers>=4.51`, PyTorch, `sentence-transformers`, `bm25s` và `faiss-cpu`.
+Model sẽ được tải từ Hugging Face ở lần chạy thật đầu tiên. Cấu hình yêu cầu Python 3.10+, `transformers>=4.51`, PyTorch, `sentence-transformers>=5`, `bm25s` và `faiss-cpu`.
 
-Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Có thể đặt riêng `device`/`dtype` cho dense, SLM và reranker nếu VRAM hạn chế. Ba model được lazy-load nhưng sẽ cùng tồn tại sau query đầu; riêng weights half precision đã khoảng 8,44 GB, còn FP32 CPU khoảng 16,89 GB, đều chưa tính activation/KV cache. Vì vậy phải đo peak memory trên máy chạy thật. Adapter HyDE ép `use_cache=True` vì config gốc của Vi-Qwen đặt giá trị này thành `false`.
+Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Có thể đặt riêng `device`/`dtype` cho dense, SLM và reranker nếu VRAM hạn chế. Ba model được lazy-load nhưng sẽ cùng tồn tại sau query đầu; riêng weights của stack mặc định khoảng 5,36 GB ở FP16/BF16 hoặc 10,72 GB ở FP32, đều chưa tính activation/KV cache. Vì vậy phải đo peak memory trên máy chạy thật. Adapter HyDE ép `use_cache=True` vì config gốc của Vi-Qwen đặt giá trị này thành `false`.
+
+Khi `dense.multi_gpu: true`, `device: auto` hoặc `cuda`, và thấy từ hai CUDA device trở lên, riêng bước encode toàn corpus trong `build-index` dùng multi-process của Sentence Transformers trên toàn bộ GPU nhìn thấy (`cuda:0`, `cuda:1`, ...). Mỗi worker giữ một bản model; T4×2 vì vậy tăng throughput nhưng không cộng VRAM thành một GPU 32 GB. Dense query và HyDE chỉ encode từng text nên giữ single-GPU để tránh chi phí tạo worker cho mỗi query. `multi_process_chunk_size` là số text giao cho worker mỗi lượt, khác với CUDA `batch_size`; để `null` cho thư viện tự chọn.
 
 ## 3. Normalize và chunk fixed-size trên Kaggle
 
@@ -181,7 +184,9 @@ python /kaggle/input/<source-slug>/retrieval/src/legal_ir/create_val_test.py \
 
 ## 5. Build index sau khi có chunk
 
-Đổi từ BGE-M3 sang Vietnamese_Embedding_v2 làm thay đổi toàn bộ vector space. Phải build index mới; manifest sẽ chủ động từ chối index được tạo bởi checkpoint/config cũ. HyDE cache cũ cũng không được tái sử dụng vì namespace bao gồm model, revision và prompt.
+Đổi dense checkpoint làm thay đổi vector space. Phải dùng một thư mục index mới; manifest sẽ chủ động từ chối index được tạo bởi checkpoint/config khác. Đổi `batch_size`, `multi_gpu` hoặc `multi_process_chunk_size` chỉ thay cách encode và không làm index cũ mất hiệu lực. HyDE cache **vẫn tái sử dụng được** khi chỉ đổi dense model, miễn là model/prompt/generation config và normalization policy của HyDE không đổi.
+
+Baseline `Vietnamese_Embedding_v2`:
 
 ```bash
 legal-ir build-index \
@@ -189,6 +194,19 @@ legal-ir build-index \
   --index-dir artifacts/indexes/vietnamese_embedding_v2_v1 \
   --config retrieval/configs/default.yaml
 ```
+
+VietLegal-Harrier:
+
+```bash
+legal-ir build-index \
+  --chunks /kaggle/working/artifacts/chunks/chunk_fixed_size.jsonl \
+  --index-dir artifacts/indexes/vietlegal_harrier_06b_v1 \
+  --config retrieval/configs/vietlegal_harrier.yaml
+```
+
+Có thể sửa trực tiếp phần `dense` của `default.yaml`; các trường cần khớp Harrier là `model_name`, `revision`, `max_length: 512` và `normalize_embeddings: true`. File preset giúp tránh quên một trường và giữ baseline để đối chiếu. Không cần chunk lại để chạy ablation trên cùng corpus, nhưng Harrier sẽ truncate `retrieval_text` sau 512 token theo tokenizer của chính nó. Vì fixed chunk hiện được cắt bằng tokenizer AITeamVN rồi prepend title, nên cần theo dõi tỷ lệ truncation khi kết luận model nào tốt hơn.
+
+Trên Kaggle T4×2, nên gọi build qua một Python process riêng (CLI ở trên hoặc `subprocess.run([sys.executable, "-m", "legal_ir", "build-index", ...])`) để multi-process khởi tạo ổn định. Log `Encoding ... dense documents with multi-GPU devices ['cuda:0', 'cuda:1']` xác nhận cả hai GPU được dùng. Nếu chỉ thấy một GPU, kiểm tra `torch.cuda.device_count()` và `CUDA_VISIBLE_DEVICES`.
 
 Kết quả:
 
@@ -200,7 +218,7 @@ artifacts/indexes/vietnamese_embedding_v2_v1/
 └── manifest.json
 ```
 
-Mặc định dense dùng exact `IndexFlatIP` trên embedding đã normalize, nên inner product là cosine. Có thể đổi `dense.index_type` thành `hnsw` khi số chunk khiến exact search quá chậm; cần rebuild index sau khi đổi.
+Mặc định dense dùng exact `IndexFlatIP` trên embedding đã normalize, nên inner product là cosine. Có thể đổi `dense.index_type` thành `hnsw` khi số chunk khiến exact search quá chậm; cần rebuild index sau khi đổi. Hai model đều cho vector 1024 chiều, nhưng tuyệt đối không dùng file `dense.faiss` của model này với model kia.
 
 Không load file FAISS từ nguồn không tin cậy. FAISS không đảm bảo kiểm tra đầy đủ artifact hỏng/độc hại khi đọc index.
 
@@ -212,7 +230,7 @@ Một câu hỏi:
 legal-ir search-one \
   --index-dir artifacts/indexes/vietnamese_embedding_v2_v1 \
   --config retrieval/configs/default.yaml \
-  --hyde-cache artifacts/cache/hyde_vi_qwen2_3b.jsonl \
+  --hyde-cache artifacts/cache/hyde_vi_qwen2_1_5b.jsonl \
   --query "Thời hạn cấp đăng ký xe máy là bao lâu?"
 ```
 
@@ -223,9 +241,10 @@ legal-ir search \
   --queries IR/warmup.json \
   --index-dir artifacts/indexes/vietnamese_embedding_v2_v1 \
   --config retrieval/configs/default.yaml \
-  --hyde-cache artifacts/cache/hyde_vi_qwen2_3b.jsonl \
+  --hyde-cache artifacts/cache/hyde_vi_qwen2_1_5b.jsonl \
   --output artifacts/runs/v1/submission.json \
-  --diagnostics artifacts/runs/v1/diagnostics.json
+  --diagnostics artifacts/runs/v1/diagnostics.json \
+  --deep-diagnostics artifacts/runs/v1/deep_diag.json
 ```
 
 `submission.json` có đúng dạng:
@@ -236,9 +255,57 @@ legal-ir search \
 }
 ```
 
-File diagnostics giữ đầy đủ top candidate theo thứ tự trước rerank, fusion score, reranker score, raw score/rank trong từng channel, evidence chunk ID và hypothetical document để phân tích lỗi. Không nộp file diagnostics.
+`diagnostics.json` giữ các document đã qua fusion top-K: thứ tự trước rerank, fusion score, reranker score, score/rank của channel nếu document còn trong pool fusion, evidence chunk ID và hypothetical document.
+
+`deep_diag.json` là trace riêng trước fusion cutoff. Với mỗi query, file lưu toàn bộ kết quả canonical của `bm25`, `dense` và `hyde` ở hai cấp:
+
+- `chunk_hits`: rank một-based, `chunk_id`, `document_id` và raw score trong chính channel đó;
+- `document_hits`: rank sau MaxP, raw score lớn nhất, `best_chunk_id` và rank của chunk tạo ra score đó;
+- `search_text` và `search_text_source`: câu hỏi thật cho BM25/dense, hypothetical document đã normalize cho HyDE;
+- số top chunk yêu cầu và số chunk/document thực trả về.
+
+Ví dụ rút gọn:
+
+```json
+{
+  "format_version": 1,
+  "pipeline_config": {"bm25": {}, "dense": {}, "hyde": {}},
+  "queries": {
+    "86666": {
+      "query": "...",
+      "hypothetical_document": "...",
+      "channels": {
+        "bm25": {
+          "search_text_source": "query",
+          "requested_top_k_chunks": 300,
+          "returned_chunk_count": 300,
+          "returned_document_count": 184,
+          "chunk_hits": [
+            {"rank": 1, "chunk_id": "...", "document_id": "280282", "score": 19.2}
+          ],
+          "document_hits": [
+            {
+              "rank": 1,
+              "document_id": "280282",
+              "score": 19.2,
+              "best_chunk_id": "...",
+              "best_chunk_rank": 1
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Chunk bị trùng được giữ score tốt nhất, score `NaN`/`Infinity` bị loại và tie được sắp deterministic giống hệt fusion. Không so sánh raw score giữa BM25 và dense/HyDE. File không lặp passage/metadata; dùng `chunk_id` để join với `INDEX_DIR/chunks.jsonl`. Nếu tắt HyDE thì channel `hyde` không xuất hiện.
+
+Deep diagnostics chỉ được thu thập khi có flag, được stream theo từng query qua file tạm rồi atomic replace, nhưng file cuối có thể lớn khoảng hàng trăm MB. Trên Kaggle phải ghi nó vào `/kaggle/working`, không phải `/kaggle/input`. Không nộp `diagnostics.json` hoặc `deep_diag.json` làm submission.
 
 HyDE dùng policy `hyde_nfc_ws_v1`: output từ Qwen, output đọc từ cache và text ngay trước dense retrieval đều được đưa về cùng dạng canonical. Ngoài line break thật, policy còn xử lý literal `\\n`, `\\r`, `\\t` mà model có thể sinh ra dưới dạng hai ký tự escape, cùng control/zero-width characters, non-breaking space và code fence. Policy không lowercase, không bỏ dấu, không sửa con số hay citation. Phiên bản policy nằm trong fingerprint cache cùng model revision, prompt và generation config; vì vậy các dòng cache cũ vẫn có thể nằm trong cùng file JSONL nhưng sẽ không được tái sử dụng sau thay đổi này.
+
+Đổi từ Vi-Qwen2-3B-RAG sang Vi-Qwen2-1.5B-RAG làm namespace HyDE thay đổi. Cache 3B không được dùng cho kết quả mới; nên dùng tên file `hyde_vi_qwen2_1_5b.jsonl` để artifact rõ ràng. Thay HyDE model không làm thay đổi corpus vectors, do đó không cần build lại BM25 hoặc `dense.faiss`.
 
 ## 7. Đánh giá Recall và Precision
 
@@ -286,7 +353,7 @@ legal-ir search ... --disable-hyde
 legal-ir search ... --disable-reranker
 ```
 
-Nên đo ít nhất candidate Recall@50 trước reranker, Recall@5/Precision@5 cuối, latency và peak VRAM. Các giá trị `top_k_chunks`, trọng số HyDE, số candidate documents và số evidence chunks/document trong YAML là điểm khởi đầu, chưa phải hyperparameter đã được xác nhận trên DSC.
+Nên đo candidate recall tại đúng cutoff `fusion.candidate_documents` trước reranker, Recall@5/Precision@5 cuối, latency và peak VRAM. Các giá trị `top_k_chunks`, trọng số HyDE, số candidate documents và số evidence chunks/document trong YAML là điểm khởi đầu, chưa phải hyperparameter đã được xác nhận trên DSC.
 
 ## 9. Test logic không cần tải model
 
@@ -300,9 +367,11 @@ Test dùng backend giả để kiểm tra fusion, document aggregation, BM25 zer
 
 - [bm25s](https://github.com/xhluca/bm25s)
 - [Vietnamese_Embedding_v2](https://huggingface.co/AITeamVN/Vietnamese_Embedding_v2)
+- [VietLegal-Harrier 0.6B](https://huggingface.co/mainguyen9/vietlegal-harrier-0.6b)
 - [Vietnamese_Reranker](https://huggingface.co/AITeamVN/Vietnamese_Reranker)
-- [Vi-Qwen2-3B-RAG](https://huggingface.co/AITeamVN/Vi-Qwen2-3B-RAG)
+- [Vi-Qwen2-1.5B-RAG](https://huggingface.co/AITeamVN/Vi-Qwen2-1.5B-RAG)
+- [Sentence Transformers multi-process/multi-GPU encoding](https://www.sbert.net/examples/sentence_transformer/applications/computing-embeddings/README.html#multi-process-multi-gpu-encoding)
 - [Sentence Transformers CrossEncoder](https://www.sbert.net/docs/package_reference/cross_encoder/model.html)
 - [FAISS index types](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes)
 
-Lưu ý reproducibility: model card Vi-Qwen2-3B-RAG hiện còn nội dung sao chép từ bản 7B và mô tả lineage không khớp config 3B. Pipeline pin trực tiếp revision của checkpoint 3B; các benchmark/giấy phép downstream ngoài phạm vi nghiên cứu hoặc cuộc thi vẫn cần được xác minh với tác giả model.
+Lưu ý reproducibility: model card/model tree Vi-Qwen2-1.5B-RAG ghi lineage từ Qwen2-7B-Instruct, trong khi checkpoint pin thực tế là `Qwen2ForCausalLM`, hidden size 1536, 28 layers và 1.543.714.304 tham số. Pipeline dựa vào config/weights của revision đã pin; không dùng mô tả lineage hoặc benchmark trên card làm bằng chứng kiến trúc.
