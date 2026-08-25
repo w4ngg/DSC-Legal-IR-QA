@@ -27,6 +27,7 @@ class DenseConfig:
     normalize_embeddings: bool = True
     multi_gpu: bool = True
     multi_process_chunk_size: int | None = None
+    multi_gpu_stall_timeout_seconds: int = 1800
     index_type: str = "flat"
     hnsw_m: int = 32
     hnsw_ef_construction: int = 200
@@ -119,6 +120,11 @@ class PipelineConfig:
                 raise ValueError(
                     "dense.multi_process_chunk_size must be null or a positive integer"
                 )
+        timeout = self.dense.multi_gpu_stall_timeout_seconds
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+            raise ValueError(
+                "dense.multi_gpu_stall_timeout_seconds must be a positive integer"
+            )
         if self.reranker.final_top_k_documents > 5:
             raise ValueError(
                 "reranker.final_top_k_documents must be <= 5 for the Task 1 format"

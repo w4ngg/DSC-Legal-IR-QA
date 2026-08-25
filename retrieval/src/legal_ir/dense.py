@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import logging
+import gc
+import os
 from pathlib import Path
 from typing import Any, Literal
 
 from .config import DenseConfig
 from .io import ChunkStore
+from .multi_gpu import encode_documents_multi_gpu
 from .runtime import detected_torch_device, inference_torch_dtype, runtime_device
 from .schema import ScoredChunk
-
-
-LOGGER = logging.getLogger("legal_ir")
 
 
 class VietnameseEmbeddingEncoder:
@@ -102,31 +101,28 @@ class VietnameseEmbeddingEncoder:
 
         devices = self._document_devices(use_multi_gpu=use_multi_gpu)
         multi_gpu = isinstance(devices, list)
-        # SentenceTransformers spawns one process per GPU. Loading the shared
-        # parent on CPU avoids reserving CUDA:0 memory before workers start.
         if multi_gpu:
-            # This also handles the less common query-then-corpus call order:
-            # discard any accelerator-loaded parent before creating workers.
+            # Never share a parent model between CUDA workers. Each isolated
+            # subprocess loads the same cached snapshot on exactly one GPU.
             self._model = None
-        model = self._load(initial_device="cpu" if multi_gpu else None)
-        if multi_gpu:
-            LOGGER.info(
-                "Encoding %d dense documents with multi-GPU devices %s",
-                len(texts),
-                devices,
-            )
-        try:
-            return model.encode_document(
+            gc.collect()
+            torch = self._torch()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return encode_documents_multi_gpu(
                 texts,
-                device=devices,
-                chunk_size=self.config.multi_process_chunk_size,
-                **self._encode_kwargs(show_progress=show_progress),
+                devices=devices,
+                config=self.config,
+                show_progress=show_progress,
             )
-        finally:
-            if multi_gpu:
-                # The temporary pool leaves the parent model on shared CPU memory.
-                # A later one-query search should lazy-load a clean accelerator copy.
-                self._model = None
+
+        model = self._load()
+        return model.encode_document(
+            texts,
+            device=devices,
+            chunk_size=self.config.multi_process_chunk_size,
+            **self._encode_kwargs(show_progress=show_progress),
+        )
 
     def encode(self, texts: list[str], *, show_progress: bool = False) -> Any:
         """Compatibility alias: unlabelled bulk inputs are treated as documents."""
@@ -183,6 +179,8 @@ class FaissDenseIndex:
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
         if vectors.ndim != 2 or vectors.shape[0] != len(chunks):
             raise ValueError(f"unexpected embedding shape: {vectors.shape}")
+        if not np.isfinite(vectors).all():
+            raise ValueError("dense embeddings contain NaN or infinite values")
 
         dimension = int(vectors.shape[1])
         if config.index_type == "flat":
@@ -199,7 +197,14 @@ class FaissDenseIndex:
 
         destination = Path(index_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(index, str(destination))
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.tmp"
+        )
+        try:
+            faiss.write_index(index, str(temporary))
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
         return cls(index, encoder, chunks, config)
 
     @classmethod

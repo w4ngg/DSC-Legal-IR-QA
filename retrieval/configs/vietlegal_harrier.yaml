@@ -15,10 +15,13 @@ dense:
   # The checkpoint was trained and published with a 512-token ST limit.
   max_length: 512
   device: auto
-  dtype: auto
+  # T4 has fast FP16 but no native BF16; keep build/query precision explicit.
+  dtype: float16
   normalize_embeddings: true
   multi_gpu: true
-  multi_process_chunk_size: null
+  # Each worker reports progress after 256 passages; batch_size remains per GPU.
+  multi_process_chunk_size: 256
+  multi_gpu_stall_timeout_seconds: 1800
   index_type: flat
   hnsw_m: 32
   hnsw_ef_construction: 200

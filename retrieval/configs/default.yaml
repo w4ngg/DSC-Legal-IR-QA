@@ -19,8 +19,10 @@ dense:
   normalize_embeddings: true
   # Build corpus embeddings on every visible CUDA GPU; query search stays single-GPU.
   multi_gpu: true
-  # Number of texts dispatched to a worker at once; null lets SentenceTransformers tune it.
+  # Macro-block per isolated GPU worker; null uses the safe default of 256 texts.
   multi_process_chunk_size: null
+  # Fail instead of hanging forever when a GPU worker stops reporting progress.
+  multi_gpu_stall_timeout_seconds: 1800
   index_type: flat
   hnsw_m: 32
   hnsw_ef_construction: 200

@@ -94,6 +94,7 @@ class IndexManifestTest(unittest.TestCase):
                 batch_size=17,
                 multi_gpu=False,
                 multi_process_chunk_size=511,
+                multi_gpu_stall_timeout_seconds=73,
             ),
         )
         chunks = ChunkStore([Chunk("c1", "21", "nội dung")])

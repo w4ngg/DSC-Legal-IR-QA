@@ -133,6 +133,16 @@ class IOAndConfigTest(unittest.TestCase):
                     PipelineConfig.from_mapping(
                         {"dense": {"multi_process_chunk_size": invalid}}
                     )
+        for invalid in (0, -1, 1.5, True):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    PipelineConfig.from_mapping(
+                        {
+                            "dense": {
+                                "multi_gpu_stall_timeout_seconds": invalid
+                            }
+                        }
+                    )
 
     def test_deep_diagnostics_writer_streams_valid_unicode_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

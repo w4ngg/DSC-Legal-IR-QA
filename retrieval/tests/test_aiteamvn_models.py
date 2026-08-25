@@ -119,15 +119,16 @@ class AITeamVNEmbeddingTest(unittest.TestCase):
         model.encode.assert_not_called()
 
     def test_document_encoding_uses_both_visible_cuda_devices(self) -> None:
-        model = Mock()
-        model.encode_document.return_value = [[1.0, 0.0], [0.0, 1.0]]
         config = DenseConfig(
             batch_size=16,
             multi_gpu=True,
             multi_process_chunk_size=512,
         )
         encoder = VietnameseEmbeddingEncoder(config)
-        encoder._model = model
+        encoder._model = Mock()
+        fake_torch = Mock()
+        fake_torch.cuda.is_available.return_value = False
+        expected = [[1.0, 0.0], [0.0, 1.0]]
 
         with (
             patch.object(
@@ -135,30 +136,33 @@ class AITeamVNEmbeddingTest(unittest.TestCase):
                 "_document_devices",
                 return_value=["cuda:0", "cuda:1"],
             ),
-            patch.object(encoder, "_load", return_value=model) as load,
+            patch.object(encoder, "_torch", return_value=fake_torch),
+            patch(
+                "legal_ir.dense.encode_documents_multi_gpu",
+                return_value=expected,
+            ) as multi_gpu,
+            patch.object(encoder, "_load") as load,
         ):
             encoded = encoder.encode_documents(
                 ["đoạn A", "đoạn B"],
                 use_multi_gpu=True,
             )
 
-        self.assertEqual(encoded, [[1.0, 0.0], [0.0, 1.0]])
-        load.assert_called_once_with(initial_device="cpu")
-        model.encode_document.assert_called_once_with(
+        self.assertEqual(encoded, expected)
+        load.assert_not_called()
+        multi_gpu.assert_called_once_with(
             ["đoạn A", "đoạn B"],
-            device=["cuda:0", "cuda:1"],
-            chunk_size=512,
-            batch_size=16,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
+            devices=["cuda:0", "cuda:1"],
+            config=config,
+            show_progress=False,
         )
         self.assertIsNone(encoder._model)
 
     def test_multi_gpu_parent_is_cleared_when_worker_encoding_fails(self) -> None:
-        model = Mock()
-        model.encode_document.side_effect = RuntimeError("worker failed")
         encoder = VietnameseEmbeddingEncoder(DenseConfig(multi_gpu=True))
+        encoder._model = Mock()
+        fake_torch = Mock()
+        fake_torch.cuda.is_available.return_value = False
 
         with (
             patch.object(
@@ -166,7 +170,11 @@ class AITeamVNEmbeddingTest(unittest.TestCase):
                 "_document_devices",
                 return_value=["cuda:0", "cuda:1"],
             ),
-            patch.object(encoder, "_load", return_value=model),
+            patch.object(encoder, "_torch", return_value=fake_torch),
+            patch(
+                "legal_ir.dense.encode_documents_multi_gpu",
+                side_effect=RuntimeError("worker failed"),
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "worker failed"):
                 encoder.encode_documents(["đoạn A"], use_multi_gpu=True)

@@ -72,11 +72,13 @@ source .venv/bin/activate
 pip install -e "./retrieval[dev]"
 ```
 
-Model sẽ được tải từ Hugging Face ở lần chạy thật đầu tiên. Cấu hình yêu cầu Python 3.10+, `transformers>=4.51`, PyTorch, `sentence-transformers>=5`, `bm25s` và `faiss-cpu`.
+Model sẽ được tải từ Hugging Face ở lần chạy thật đầu tiên. Cấu hình yêu cầu Python 3.10+, `transformers==4.57.6`, `sentence-transformers==5.1.2`, PyTorch, `bm25s` và `faiss-cpu`. Hai thư viện model được pin vì Harrier công bố metadata bằng Transformers 4.57.6, còn source cần API `encode_query()`/`encode_document()` của SentenceTransformers 5.1.2; không để Kaggle tự nâng lên major version mới trong một scheduled run.
 
-Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Có thể đặt riêng `device`/`dtype` cho dense, SLM và reranker nếu VRAM hạn chế. Ba model được lazy-load nhưng sẽ cùng tồn tại sau query đầu; riêng weights của stack mặc định khoảng 5,36 GB ở FP16/BF16 hoặc 10,72 GB ở FP32, đều chưa tính activation/KV cache. Vì vậy phải đo peak memory trên máy chạy thật. Adapter HyDE ép `use_cache=True` vì config gốc của Vi-Qwen đặt giá trị này thành `false`.
+Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Preset Harrier đặt rõ `float16` để index build và query cùng precision trên T4; T4 không có native BF16. Có thể đặt riêng `device`/`dtype` cho dense, SLM và reranker nếu VRAM hạn chế. Ba model được lazy-load nhưng sẽ cùng tồn tại sau query đầu; riêng weights của stack mặc định khoảng 5,36 GB ở FP16/BF16 hoặc 10,72 GB ở FP32, đều chưa tính activation/KV cache. Vì vậy phải đo peak memory trên máy chạy thật. Adapter HyDE ép `use_cache=True` vì config gốc của Vi-Qwen đặt giá trị này thành `false`.
 
-Khi `dense.multi_gpu: true`, `device: auto` hoặc `cuda`, và thấy từ hai CUDA device trở lên, riêng bước encode toàn corpus trong `build-index` dùng multi-process của Sentence Transformers trên toàn bộ GPU nhìn thấy (`cuda:0`, `cuda:1`, ...). Mỗi worker giữ một bản model; T4×2 vì vậy tăng throughput nhưng không cộng VRAM thành một GPU 32 GB. Dense query và HyDE chỉ encode từng text nên giữ single-GPU để tránh chi phí tạo worker cho mỗi query. `multi_process_chunk_size` là số text giao cho worker mỗi lượt, khác với CUDA `batch_size`; để `null` cho thư viện tự chọn.
+Khi `dense.multi_gpu: true`, `device: auto` hoặc `cuda`, và thấy từ hai CUDA device trở lên, riêng bước encode toàn corpus trong `build-index` chạy các Python worker độc lập. Parent resolve checkpoint một lần nhưng không load model; mỗi worker chỉ nhìn thấy một GPU qua `CUDA_VISIBLE_DEVICES`, tự load một model replica, encode một contiguous shard và ghi `.npy` tạm. Parent poll exit code/status, ghép shard đúng thứ tự corpus và dừng toàn bộ peer nếu một worker lỗi hoặc không báo tiến độ trong `multi_gpu_stall_timeout_seconds`. Thiết kế này không dùng shared parent model hoặc queue tensor của SentenceTransformers.
+
+Trên Kaggle T4×2, hai T4 có 16 GB VRAM riêng, không hợp thành một GPU 32 GB; notebook chỉ có 4 CPU core và 29 GB host RAM. Worker tự giới hạn khoảng hai CPU thread, dùng một T4/model replica và ghi log riêng để tránh progress bar chồng nhau. Dense query và HyDE vẫn single-GPU vì mỗi lần chỉ encode một text. `batch_size` là số passage mỗi forward trên **mỗi GPU**; `multi_process_chunk_size` là macro-block được ghi heartbeat sau khi hoàn tất, mặc định nội bộ 256 nếu để `null`. Có thể đặt `LEGAL_IR_MULTI_GPU_TMPDIR` nếu muốn chọn scratch directory khác cho input/output shard tạm.
 
 ## 3. Normalize và chunk fixed-size trên Kaggle
 
@@ -184,7 +186,7 @@ python /kaggle/input/<source-slug>/retrieval/src/legal_ir/create_val_test.py \
 
 ## 5. Build index sau khi có chunk
 
-Đổi dense checkpoint làm thay đổi vector space. Phải dùng một thư mục index mới; manifest sẽ chủ động từ chối index được tạo bởi checkpoint/config khác. Đổi `batch_size`, `multi_gpu` hoặc `multi_process_chunk_size` chỉ thay cách encode và không làm index cũ mất hiệu lực. HyDE cache **vẫn tái sử dụng được** khi chỉ đổi dense model, miễn là model/prompt/generation config và normalization policy của HyDE không đổi.
+Đổi dense checkpoint làm thay đổi vector space. Phải dùng một thư mục index mới; manifest sẽ chủ động từ chối index được tạo bởi checkpoint/config khác. Đổi `batch_size`, `multi_gpu`, `multi_process_chunk_size` hoặc `multi_gpu_stall_timeout_seconds` chỉ thay runtime encode và không làm index cũ mất hiệu lực. HyDE cache **vẫn tái sử dụng được** khi chỉ đổi dense model, miễn là model/prompt/generation config và normalization policy của HyDE không đổi.
 
 Baseline `Vietnamese_Embedding_v2`:
 
@@ -206,7 +208,30 @@ legal-ir build-index \
 
 Có thể sửa trực tiếp phần `dense` của `default.yaml`; các trường cần khớp Harrier là `model_name`, `revision`, `max_length: 512` và `normalize_embeddings: true`. File preset giúp tránh quên một trường và giữ baseline để đối chiếu. Không cần chunk lại để chạy ablation trên cùng corpus, nhưng Harrier sẽ truncate `retrieval_text` sau 512 token theo tokenizer của chính nó. Vì fixed chunk hiện được cắt bằng tokenizer AITeamVN rồi prepend title, nên cần theo dõi tỷ lệ truncation khi kết luận model nào tốt hơn.
 
-Trên Kaggle T4×2, nên gọi build qua một Python process riêng (CLI ở trên hoặc `subprocess.run([sys.executable, "-m", "legal_ir", "build-index", ...])`) để multi-process khởi tạo ổn định. Log `Encoding ... dense documents with multi-GPU devices ['cuda:0', 'cuda:1']` xác nhận cả hai GPU được dùng. Nếu chỉ thấy một GPU, kiểm tra `torch.cuda.device_count()` và `CUDA_VISIBLE_DEVICES`.
+Trước khi build trên Kaggle T4×2, xác nhận notebook thực sự được cấp hai GPU:
+
+```python
+import subprocess
+import sys
+
+subprocess.run(["nvidia-smi", "-L"], check=True)
+subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        (
+            "import torch; "
+            "print('CUDA:', torch.cuda.is_available()); "
+            "print('GPU count:', torch.cuda.device_count()); "
+            "print([torch.cuda.get_device_name(i) "
+            "for i in range(torch.cuda.device_count())])"
+        ),
+    ],
+    check=True,
+)
+```
+
+Kết quả cần có hai T4 và `GPU count: 2`. Có thể gọi CLI hoặc Python API trực tiếp; parent sẽ tự mở hai module worker bằng interpreter sạch. Log đúng có dạng `Encoding ... with 2 isolated GPU workers ['cuda:0', 'cuda:1']`, sau đó là `Dense multi-GPU progress ... (gpu0=..., gpu1=...)`. Nếu worker lỗi/OOM/đứng quá timeout, lệnh trả exception kèm status, traceback và cuối worker log thay vì chờ vô hạn. `dense.faiss` được ghi qua file tạm rồi replace; worker shard cũng nằm trong temporary directory và được dọn khi hoàn tất hoặc interrupt.
 
 Kết quả:
 
@@ -371,6 +396,9 @@ Test dùng backend giả để kiểm tra fusion, document aggregation, BM25 zer
 - [Vietnamese_Reranker](https://huggingface.co/AITeamVN/Vietnamese_Reranker)
 - [Vi-Qwen2-1.5B-RAG](https://huggingface.co/AITeamVN/Vi-Qwen2-1.5B-RAG)
 - [Sentence Transformers multi-process/multi-GPU encoding](https://www.sbert.net/examples/sentence_transformer/applications/computing-embeddings/README.html#multi-process-multi-gpu-encoding)
+- [Kaggle Notebook T4×2 specifications](https://www.kaggle.com/docs/notebooks)
+- [NVIDIA T4 datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet.pdf)
+- [PyTorch multiprocessing best practices](https://docs.pytorch.org/docs/stable/notes/multiprocessing.html)
 - [Sentence Transformers CrossEncoder](https://www.sbert.net/docs/package_reference/cross_encoder/model.html)
 - [FAISS index types](https://github.com/facebookresearch/faiss/wiki/Faiss-indexes)
 
