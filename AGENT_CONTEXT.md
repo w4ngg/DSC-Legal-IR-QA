@@ -1,6 +1,6 @@
 # DSC Legal — Context cho các session sau
 
-> Snapshot đã được đọc và kiểm tra toàn bộ vào 2026-08-15; khung retrieval Task 1 được cập nhật dense adapter/multi-GPU vào 2026-08-24. Đọc tệp này đầu tiên khi bắt đầu làm việc trong workspace.
+> Snapshot đã được đọc và kiểm tra toàn bộ vào 2026-08-15; khung retrieval Task 1 được cập nhật dense adapter/multi-GPU vào 2026-08-24 và roadmap diagnostics/ablation vào 2026-08-26. Đọc tệp này đầu tiên khi bắt đầu làm việc trong workspace.
 
 ## Mục đích workspace
 
@@ -29,7 +29,8 @@ Hai tập câu hỏi IR và QA không dùng chung query ID. LegalQA không có n
 │   ├── warmup.json
 │   └── public-official.json
 ├── research_method/                         # các phiên bản nghiên cứu phương pháp IR/QA
-│   └── research_v1.md                       # draft phương pháp LegalIR đầu tiên
+│   ├── research_v1.md                       # draft phương pháp LegalIR đầu tiên
+│   └── method.md                            # roadmap cải tiến và ablation theo diagnostics
 ├── retrieval/                               # code pipeline khung Task 1
 │   ├── configs/default.yaml                 # model/top-k/RRF/reranker config
 │   ├── configs/vietlegal_harrier.yaml       # preset Harrier 0.6B, cần index riêng
@@ -240,7 +241,9 @@ Quy ước:
 - Mỗi bản phải ghi ngày tạo, phạm vi Task 1/Task 2, trạng thái draft hay đã được thực nghiệm, nguồn tham khảo và khác biệt so với bản trước.
 - Kết quả thực nghiệm phải ghi rõ split, cách xử lý duplicate/leakage, metric và artifact/code đã dùng.
 - Nghiên cứu hiện có: `research_method/research_v1.md` — draft ban đầu cho Task 1, tập trung vào dataset legal retrieval, structural chunking, hybrid BM25+dense, document aggregation, reranking và hard-negative training.
+- `research_method/method.md` — research draft ngày 2026-08-26 cho pipeline Harrier hiện tại, tập trung vào stage-ceiling analysis từ `diagnostics.json`/`deep_diag.json`, ablation có thể replay offline, thí nghiệm cần rerun/rebuild và thứ tự training LambdaMART → reranker → Harrier.
 - `research_v1.md` là đề xuất nghiên cứu, chưa phải benchmark đã được xác nhận trên dữ liệu DSC.
+- `method.md` cũng là đề xuất nghiên cứu, chưa chứa kết quả thực nghiệm DSC; người dùng yêu cầu tên file này nên đây là ngoại lệ có chủ đích so với quy ước tên tuần tự.
 
 ## Hướng dẫn làm việc cho agent tiếp theo
 
