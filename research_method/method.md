@@ -50,6 +50,72 @@ Các chi tiết cần giữ cố định khi so sánh:
 
 Lần chạy cũ có thể dùng config khác preset hiện tại. Khi phân tích, phải tin `deep_diag.json.pipeline_config` và index manifest của chính run đó, không suy ra config từ tên folder.
 
+### 2.1. Metadata đang được tạo trong pipeline
+
+Pipeline hiện tại có metadata, nhưng chưa phải metadata pháp lý phân cấp đầy đủ. Fixed-size chunker chưa parse `Chương/Mục/Điều/Khoản/Điểm/Phụ lục`; nó chỉ sinh metadata phục vụ mapping, kiểm tra reproducibility, debug chunking và đưa title vào text dùng để retrieve.
+
+Mỗi dòng trong `chunks.jsonl` có cấu trúc:
+
+```json
+{
+  "chunk_id": "21:fixed_legal_nfc_ws_v1_384_64:000003",
+  "document_id": "21",
+  "passage": "nội dung chunk sau normalize...",
+  "retrieval_text": "Tên văn bản: ...\nnội dung chunk sau normalize...",
+  "metadata": {
+    "...": "..."
+  }
+}
+```
+
+Các trường ngoài `metadata` mới là contract chính của retrieval:
+
+| Trường | Vai trò |
+| --- | --- |
+| `chunk_id` | ID ổn định của chunk, gồm `document_id`, version normalize/chunking, `chunk_size`, `overlap`, và thứ tự chunk. |
+| `document_id` | ID văn bản gốc dùng để aggregate chunk thành document và ghi submission. |
+| `passage` | Nội dung chunk đã normalize, không kèm title. |
+| `retrieval_text` | Text thực sự được BM25, dense encoder và reranker đọc; hiện là `Tên văn bản: <retrieval_title>` + `passage` nếu có title. |
+
+`metadata` trong từng chunk hiện gồm các trường bắt buộc sau:
+
+| Trường metadata | Ý nghĩa |
+| --- | --- |
+| `chunk_strategy` | Chiến lược chunking, hiện là `fixed_token`. |
+| `normalization_version` | Version normalize, hiện là `legal_nfc_ws_v1`. |
+| `chunk_index` | Số thứ tự chunk trong document, bắt đầu từ 0. |
+| `chunk_count_in_document` | Tổng số chunk của document đó. |
+| `token_start`, `token_end`, `token_count` | Span token của chunk theo tokenizer dùng khi chunking. |
+| `normalized_character_start`, `normalized_character_end` | Span ký tự của chunk trong văn bản đã normalize. |
+| `normalized_document_characters` | Độ dài văn bản sau normalize theo ký tự. |
+| `document_token_count` | Tổng số token của document theo tokenizer chunking. |
+| `source_file` | Tên file nguồn, ví dụ `context_21.json`. |
+
+Các trường metadata tùy chọn:
+
+| Trường metadata | Khi nào có |
+| --- | --- |
+| `document_name` | Có khi source document có `name`, hoặc suy được title từ URL slug. |
+| `retrieval_title` | Bản title đã normalize để prepend vào `retrieval_text`. |
+| `source_link` | Có khi source document có `link`. |
+
+Hiện tại `metadata` dict không được dùng trực tiếp như feature scoring trong BM25/dense/fusion/reranker. Phần có ảnh hưởng retrieval thật là `retrieval_text`, vì title đã được prepend vào text đem đi index. Các metadata còn lại chủ yếu dùng để join ngược `chunk_id -> document_id`, phân tích lỗi, đo truncation, thiết kế evidence selector/LambdaMART sau này.
+
+Khi build index, pipeline cũng ghi `manifest.json` trong index directory. Manifest này không chứa từng metadata pháp lý, nhưng khóa lại tính tương thích của artifact:
+
+- `chunk_count` và `chunk_records_sha256`, hash trên `chunk_id`, `document_id`, `index_text`;
+- dense config: `model_name`, `revision`, `max_length`, `dtype`, normalize flag, `index_type`, tham số HNSW nếu có;
+- BM25 config: `method`, `k1`, `b`.
+
+Khi chunking, chunk manifest lưu thêm normalization policy, tokenizer name/revision/backend hash, chunk size, overlap, statistics và danh sách `skipped_empty_document_ids`. Đây là metadata cấp artifact để biết một index được tạo từ corpus/chunker/tokenizer nào.
+
+Ở runtime, `diagnostics.json` và `deep_diagnostics.json` sinh metadata phân tích:
+
+- `diagnostics.json`: `results`, `fused_candidates`, `fusion_score`, `rerank_score`, `channel_ranks`, `channel_scores`, `evidence_chunk_ids`, `evidence_rerank_scores`, `hypothetical_document`;
+- `deep_diagnostics.json`: với từng query và từng lane BM25/dense/HyDE có `chunk_hits` gồm rank/chunk/doc/score, `document_hits` sau MaxP, text dùng để search và full `pipeline_config`.
+
+Kết luận thực dụng: pipeline hiện đã có metadata đủ để tái lập index, trace chunk và phân tích retrieval. Nhưng để tăng chất lượng bằng metadata pháp lý, cần bước preprocessing mới parse hierarchy thật rồi thêm các trường như `document_type`, `issuer`, `law_number`, `effective_date`, `chapter`, `section`, `article`, `clause`, `point`, `appendix`, `heading_path`. Sau đó mới quyết định đưa chúng vào `retrieval_text`, feature LambdaMART, filter hoặc evidence selection.
+
 ## 3. P0 — sửa trần chất lượng và khả năng tái lập
 
 ### 3.1. Document rỗng

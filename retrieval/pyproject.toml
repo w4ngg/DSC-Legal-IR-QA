@@ -26,8 +26,10 @@ dev = [
 
 [project.scripts]
 legal-ir = "legal_ir.cli:main"
+legal-ir-chunk-dual = "legal_ir.chunk_dual_granularity:main"
 legal-ir-chunk-fixed-size = "legal_ir.chunk_fixed_size:main"
 legal-ir-create-val-test = "legal_ir.create_val_test:main"
+legal-ir-diagnostics-top2-mean = "legal_ir.diagnostics_top2_mean_submission:main"
 legal-ir-evaluate = "legal_ir.evaluate_recall_precision:main"
 
 [tool.setuptools.packages.find]

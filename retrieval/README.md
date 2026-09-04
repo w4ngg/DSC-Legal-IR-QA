@@ -141,6 +141,33 @@ Mỗi `chunk_id` chứa normalization version, kích thước và overlap, ví d
 
 `token_start/end` và `normalized_character_start/end` trong metadata đều là half-open offsets trên normalized document. Manifest mặc định là `chunk_fixed_size.manifest.json` nếu không truyền `--manifest`.
 
+### Dual-granularity: short retrieval + long reranker
+
+Để thử method short/long mà vẫn giữ baseline fixed-token, dùng entry point riêng. Nó đọc mỗi source document đúng một lần, giữ các line boundary không rỗng, tạo short chunk tối đa 450 ký tự không overlap và đồng thời pack chúng thành long chunk tối đa 2.000 ký tự, overlap bằng một short chunk hoàn chỉnh:
+
+```bash
+python -m legal_ir.chunk_dual_granularity \
+  --input-dir /kaggle/input/<dataset-slug>/selected-contexts \
+  --output-dir /kaggle/working/artifacts/chunks/dual_v1 \
+  --short-max-characters 450 \
+  --long-max-characters 2000 \
+  --long-overlap-short-chunks 1
+```
+
+Lệnh này chỉ dùng CPU và standard library; không tải tokenizer/model và không cần GPU. Nó stream theo từng document thay vì giữ toàn corpus trong RAM. Output gồm:
+
+```text
+dual_v1/
+├── short_chunks.jsonl     # input duy nhất cho BM25 + dense build-index
+├── long_chunks.jsonl      # context cho reranker, không encode/index
+├── short_to_long.jsonl    # mapping explicit, một record/short chunk
+└── manifest.json          # hash, config, thống kê và skipped IDs
+```
+
+Short chunk ưu tiên biên `Điều`/`Khoản`/mục đánh số ở đầu source line; clause dài tiếp tục được tách ở dấu kết câu, line rồi word boundary. Short chunks không overlap. Long chunks chỉ ghép các short chunk hoàn chỉnh, vì vậy mọi short chunk luôn nằm trọn trong ít nhất một long chunk. Mapping chứa `primary_long_chunk_id` và toàn bộ `long_chunk_ids`; metadata hai file dùng chung half-open offset trên normalized document. Title có thể nằm trong `retrieval_text` nhưng giới hạn 450/2.000 chỉ áp dụng cho `passage`.
+
+Không ghi đè baseline: dùng thư mục version mới như `dual_v1`. `manifest.json` được publish cuối như commit marker; khi copy artifact giữa Kaggle Dataset/notebook phải copy cả bốn file.
+
 ## 4. Tạo train/validation/test nội bộ
 
 `create_val_test.py` lấy ngẫu nhiên các cặp `query_id -> record` từ `IR/train.json` mà không sửa file gốc. Mặc định tạo split 80/10/10 với seed cố định: train 5.600, validation 700 và test 700.
@@ -205,6 +232,21 @@ legal-ir build-index \
   --index-dir artifacts/indexes/vietlegal_harrier_06b_v1 \
   --config retrieval/configs/vietlegal_harrier.yaml
 ```
+
+`Vietnamese_Embedding_v2` với dual-granularity trên Kaggle T4×2:
+
+```bash
+python -m legal_ir.cli build-index \
+  --chunks /kaggle/working/artifacts/chunks/dual_v1/short_chunks.jsonl \
+  --index-dir /kaggle/working/artifacts/indexes/vietnamese_embedding_v2_dual_v1 \
+  --config retrieval/configs/default.yaml
+```
+
+`default.yaml` pin `AITeamVN/Vietnamese_Embedding_v2` tại revision `18b44161e041bf1d3a333ab5144b5b7b93f914d2`, `max_length: 2048`, vector normalized 1.024 chiều, batch 32 mỗi GPU và `dense.multi_gpu: true`. Trên T4, `dtype: auto` được resolve thành float16. Khi notebook thấy hai CUDA device, build dense tự chia short corpus thành hai contiguous shard, mỗi subprocess chỉ nhìn thấy một T4, rồi ghép vector về đúng thứ tự row trước khi ghi FAISS. BM25 vẫn build trên CPU. Chỉ `short_chunks.jsonl` được load và encode; không truyền `long_chunks.jsonl` vào `build-index`.
+
+Trước khi chạy full build, nên smoke-test 100–1.000 short chunks trong một output/index directory tạm và kiểm tra log có dòng `Encoding ... with 2 isolated GPU workers ['cuda:0', 'cuda:1']`. Nếu chỉ thấy một GPU, code tự fallback single-device thay vì giả lập multi-GPU. Không thay `CUDA_VISIBLE_DEVICES` giữa lúc parent đang chạy.
+
+Cảnh báo capacity: audit chỉ đọc trên 8.532 source document hiện tại với rule mặc định dự kiến tạo 2.050.281 short chunks và 205.407 long chunks. Riêng ma trận dense 1.024 chiều float32 đã khoảng 7,82 GiB, chưa gồm FAISS, BM25, `ChunkStore`, worker shard và model. Multi-GPU làm nhanh bước encode nhưng không giảm host RAM hoặc dung lượng scratch. `build-index` hiện vẫn ghép toàn bộ worker shard trước khi `index.add`, nên chưa nên coi full dual build là chắc chắn vừa Kaggle 29 GiB; bước engineering kế tiếp là add vector shard vào FAISS theo block và giải phóng BM25 trước giai đoạn dense, hoặc giảm candidate corpus bằng một ablation chunking có chủ đích.
 
 Có thể sửa trực tiếp phần `dense` của `default.yaml`; các trường cần khớp Harrier là `model_name`, `revision`, `max_length: 512` và `normalize_embeddings: true`. File preset giúp tránh quên một trường và giữ baseline để đối chiếu. Không cần chunk lại để chạy ablation trên cùng corpus, nhưng Harrier sẽ truncate `retrieval_text` sau 512 token theo tokenizer của chính nó. Vì fixed chunk hiện được cắt bằng tokenizer AITeamVN rồi prepend title, nên cần theo dõi tỷ lệ truncation khi kết luận model nào tốt hơn.
 
@@ -327,6 +369,18 @@ Ví dụ rút gọn:
 Chunk bị trùng được giữ score tốt nhất, score `NaN`/`Infinity` bị loại và tie được sắp deterministic giống hệt fusion. Không so sánh raw score giữa BM25 và dense/HyDE. File không lặp passage/metadata; dùng `chunk_id` để join với `INDEX_DIR/chunks.jsonl`. Nếu tắt HyDE thì channel `hyde` không xuất hiện.
 
 Deep diagnostics chỉ được thu thập khi có flag, được stream theo từng query qua file tạm rồi atomic replace, nhưng file cuối có thể lớn khoảng hàng trăm MB. Trên Kaggle phải ghi nó vào `/kaggle/working`, không phải `/kaggle/input`. Không nộp `diagnostics.json` hoặc `deep_diag.json` làm submission.
+
+### Replay top-2 mean từ diagnostics
+
+Nếu muốn thử ablation đổi MaxP sau reranker sang top-2 mean mà không chạy lại model, dùng `diagnostics.json` đã có:
+
+```bash
+python -m legal_ir.diagnostics_top2_mean_submission \
+  --diagnostics artifacts/runs/v1/diagnostics.json \
+  --output artifacts/runs/v1/submission_top2_mean.json
+```
+
+Script đọc `fused_candidates`, tính lại document score bằng trung bình hai điểm cao nhất trong `evidence_rerank_scores`, rồi ghi output theo schema chính thức `{"query_id": {"answer": [...]}}` với tối đa 5 document/query. Nếu một document chỉ có một evidence score thì dùng chính score đó.
 
 HyDE dùng policy `hyde_nfc_ws_v1`: output từ Qwen, output đọc từ cache và text ngay trước dense retrieval đều được đưa về cùng dạng canonical. Ngoài line break thật, policy còn xử lý literal `\\n`, `\\r`, `\\t` mà model có thể sinh ra dưới dạng hai ký tự escape, cùng control/zero-width characters, non-breaking space và code fence. Policy không lowercase, không bỏ dấu, không sửa con số hay citation. Phiên bản policy nằm trong fingerprint cache cùng model revision, prompt và generation config; vì vậy các dòng cache cũ vẫn có thể nằm trong cùng file JSONL nhưng sẽ không được tái sử dụng sau thay đổi này.
 
