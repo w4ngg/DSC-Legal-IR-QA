@@ -1,0 +1,51 @@
+bm25:
+  method: lucene
+  k1: 1.2
+  b: 0.75
+  top_k_chunks: 150
+  mmap: true
+dense:
+  model_name: AITeamVN/Vietnamese_Embedding_v2
+  revision: 18b44161e041bf1d3a333ab5144b5b7b93f914d2
+  top_k_chunks: 100
+  batch_size: 16
+  max_length: 2048
+  device: auto
+  dtype: float16
+  normalize_embeddings: true
+  multi_gpu: true
+  multi_process_chunk_size: 256
+  multi_gpu_stall_timeout_seconds: 1800
+  index_type: flat
+  hnsw_m: 32
+  hnsw_ef_construction: 200
+  hnsw_ef_search: 128
+hyde:
+  enabled: false
+  model_name: AITeamVN/Vi-Qwen2-1.5B-RAG
+  revision: c8272ce4ad08da4cc27b4bda59faabc66caedf07
+  top_k_chunks: 200
+  max_new_tokens: 192
+  do_sample: false
+  temperature: 0.7
+  top_p: 0.8
+  device: auto
+  dtype: auto
+  trust_remote_code: false
+fusion:
+  rrf_k: 60
+  candidate_documents: 30
+  evidence_chunks_per_document: 3
+  channel_weights:
+    bm25: 1.0
+    dense: 1.0
+    hyde: 0.5
+reranker:
+  enabled: true
+  model_name: AITeamVN/Vietnamese_Reranker
+  revision: f536976248403314225d7fdfdbc87f0e9516a54e
+  batch_size: 4
+  max_length: 2304
+  device: auto
+  dtype: auto
+  final_top_k_documents: 5

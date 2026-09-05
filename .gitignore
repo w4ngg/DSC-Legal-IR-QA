@@ -5,4 +5,6 @@ __pycache__/
 runs/
 indexes/
 indexes.zip
+# Keep reusable analysis source while ignoring generated analysis artifacts.
 analysis/
+*.zip
