@@ -1,8 +1,8 @@
 # Khung retrieval cho DSC 2026 LegalIR
 
-Thư mục này chứa fixed-size preprocessing và retrieval pipeline. Fixed-token chunker là baseline để chạy thử; structural chunking vẫn để dành cho giai đoạn sau. Code không sửa dữ liệu gốc trong `selected-contexts/`.
+Thư mục này chứa fixed-size baseline, dual-granularity preprocessing và retrieval pipeline. Dual chunker dùng biên pháp lý/danh sách để tạo short retrieval chunks cùng long reranker chunks; parser hierarchy đầy đủ vẫn để dành cho giai đoạn sau. Code không sửa dữ liệu gốc trong `selected-contexts/`.
 
-Pipeline mặc định:
+Pipeline mặc định (legacy, vẫn là mode mặc định):
 
 ```text
 BM25(query) ──────────────────────────┐
@@ -25,7 +25,14 @@ Các nguyên tắc đã được khóa trong implementation và unit test:
 - Reranker luôn dùng câu hỏi gốc và `retrieval_text` của chunk thật, không dùng hypothetical document.
 - Trong các evidence đưa vào reranker, code giữ ít nhất một chunk do query gốc tìm được nếu document có chunk như vậy; HyDE không được chiếm toàn bộ evidence slots.
 - Output được deduplicate ở cấp document và bị giới hạn tối đa 5 ID.
-- Có thể tắt riêng HyDE/reranker để chạy ablation.
+- Trong flow legacy có thể tắt riêng HyDE/reranker để chạy ablation; mode
+  long-context luôn cần reranker.
+
+Ngoài flow legacy, pipeline có mode dual long-context opt-in: BM25/dense/HyDE
+vẫn tìm trên **short chunks** trong index, sau đó union short candidate, map qua
+long chunks thật và dùng pretrained reranker trên long context. Mode này không
+thay schema/index của flow cũ; chỉ được bật bởi một config `long_context` riêng
+và một thư mục dual artifacts được truyền ở runtime.
 
 Model mặc định là `AITeamVN/Vietnamese_Embedding_v2` (567.754.752), `AITeamVN/Vietnamese_Reranker` (567.755.777) và `AITeamVN/Vi-Qwen2-1.5B-RAG` (1.543.714.304 tham số). Tổng checkpoint duy nhất là **2.679.224.833 tham số**, nằm dưới giới hạn 4B. Preset thay dense bằng `mainguyen9/vietlegal-harrier-0.6b` (596.049.920 tham số) có tổng **2.707.520.001**, cũng dưới 4B. Các revision đầy đủ được pin trong YAML để runtime/cache không vô tình dùng phiên bản weights khác. Quantization chỉ giảm VRAM, không thay đổi số tham số.
 
@@ -77,6 +84,15 @@ Model sẽ được tải từ Hugging Face ở lần chạy thật đầu tiên
 Với `dtype: auto`, code dùng BF16 trên CUDA có hỗ trợ, FP16 trên CUDA còn lại/MPS và FP32 trên CPU. Preset Harrier đặt rõ `float16` để index build và query cùng precision trên T4; T4 không có native BF16. Có thể đặt riêng `device`/`dtype` cho dense, SLM và reranker nếu VRAM hạn chế. Ba model được lazy-load nhưng sẽ cùng tồn tại sau query đầu; riêng weights của stack mặc định khoảng 5,36 GB ở FP16/BF16 hoặc 10,72 GB ở FP32, đều chưa tính activation/KV cache. Vì vậy phải đo peak memory trên máy chạy thật. Adapter HyDE ép `use_cache=True` vì config gốc của Vi-Qwen đặt giá trị này thành `false`.
 
 Khi `dense.multi_gpu: true`, `device: auto` hoặc `cuda`, và thấy từ hai CUDA device trở lên, riêng bước encode toàn corpus trong `build-index` chạy các Python worker độc lập. Parent resolve checkpoint một lần nhưng không load model; mỗi worker chỉ nhìn thấy một GPU qua `CUDA_VISIBLE_DEVICES`, tự load một model replica, encode một contiguous shard và ghi `.npy` tạm. Parent poll exit code/status, ghép shard đúng thứ tự corpus và dừng toàn bộ peer nếu một worker lỗi hoặc không báo tiến độ trong `multi_gpu_stall_timeout_seconds`. Thiết kế này không dùng shared parent model hoặc queue tensor của SentenceTransformers.
+
+Reranker có đường multi-GPU riêng. Khi `reranker.multi_gpu: true`, `device: auto`
+hoặc `cuda` và có ít nhất hai CUDA device, mỗi GPU giữ một model replica;
+với **mỗi query**, danh sách long passages được chia thành các contiguous shard
+cho các worker rồi score được ghép lại đúng thứ tự input. Đây là data parallel
+theo passage, không phải gộp VRAM và không chia các query độc lập cho từng GPU.
+Nếu chỉ có một GPU, code fallback về scorer single-device. Timeout worker dùng
+`reranker.multi_gpu_stall_timeout_seconds`; scratch có thể đặt bằng
+`LEGAL_IR_RERANKER_MULTI_GPU_TMPDIR`.
 
 Trên Kaggle T4×2, hai T4 có 16 GB VRAM riêng, không hợp thành một GPU 32 GB; notebook chỉ có 4 CPU core và 29 GB host RAM. Worker tự giới hạn khoảng hai CPU thread, dùng một T4/model replica và ghi log riêng để tránh progress bar chồng nhau. Dense query và HyDE vẫn single-GPU vì mỗi lần chỉ encode một text. `batch_size` là số passage mỗi forward trên **mỗi GPU**; `multi_process_chunk_size` là macro-block được ghi heartbeat sau khi hoàn tất, mặc định nội bộ 256 nếu để `null`. Có thể đặt `LEGAL_IR_MULTI_GPU_TMPDIR` nếu muốn chọn scratch directory khác cho input/output shard tạm.
 
@@ -168,6 +184,11 @@ Short chunk ưu tiên biên `Điều`/`Khoản`/mục đánh số ở đầu sou
 
 Không ghi đè baseline: dùng thư mục version mới như `dual_v1`. `manifest.json` được publish cuối như commit marker; khi copy artifact giữa Kaggle Dataset/notebook phải copy cả bốn file.
 
+Index được build từ `short_chunks.jsonl` và bản copy row-stable của file này trở
+thành `INDEX_DIR/chunks.jsonl`. `long_chunks.jsonl` không được encode hay thêm
+vào BM25/FAISS. Khi search long-context, giữ index short riêng và mount cả thư
+mục `dual_v1` để CLI đọc mapping/long text qua `--dual-chunks-dir`.
+
 ## 4. Tạo train/validation/test nội bộ
 
 `create_val_test.py` lấy ngẫu nhiên các cặp `query_id -> record` từ `IR/train.json` mà không sửa file gốc. Mặc định tạo split 80/10/10 với seed cố định: train 5.600, validation 700 và test 700.
@@ -239,10 +260,10 @@ legal-ir build-index \
 python -m legal_ir.cli build-index \
   --chunks /kaggle/working/artifacts/chunks/dual_v1/short_chunks.jsonl \
   --index-dir /kaggle/working/artifacts/indexes/vietnamese_embedding_v2_dual_v1 \
-  --config retrieval/configs/default.yaml
+  --config retrieval/configs/vietnamese_embedding_dual.yaml
 ```
 
-`default.yaml` pin `AITeamVN/Vietnamese_Embedding_v2` tại revision `18b44161e041bf1d3a333ab5144b5b7b93f914d2`, `max_length: 2048`, vector normalized 1.024 chiều, batch 32 mỗi GPU và `dense.multi_gpu: true`. Trên T4, `dtype: auto` được resolve thành float16. Khi notebook thấy hai CUDA device, build dense tự chia short corpus thành hai contiguous shard, mỗi subprocess chỉ nhìn thấy một T4, rồi ghép vector về đúng thứ tự row trước khi ghi FAISS. BM25 vẫn build trên CPU. Chỉ `short_chunks.jsonl` được load và encode; không truyền `long_chunks.jsonl` vào `build-index`.
+`vietnamese_embedding_dual.yaml` pin `AITeamVN/Vietnamese_Embedding_v2` tại revision `18b44161e041bf1d3a333ab5144b5b7b93f914d2`, `max_length: 2048`, vector normalized 1.024 chiều, explicit FP16, batch 16 mỗi GPU và `dense.multi_gpu: true`. Khi notebook thấy hai CUDA device, build dense tự chia short corpus thành hai contiguous shard, mỗi subprocess chỉ nhìn thấy một T4, rồi ghép vector về đúng thứ tự row trước khi ghi FAISS. BM25 vẫn build trên CPU. Chỉ `short_chunks.jsonl` được load và encode; không truyền `long_chunks.jsonl` vào `build-index`.
 
 Trước khi chạy full build, nên smoke-test 100–1.000 short chunks trong một output/index directory tạm và kiểm tra log có dòng `Encoding ... with 2 isolated GPU workers ['cuda:0', 'cuda:1']`. Nếu chỉ thấy một GPU, code tự fallback single-device thay vì giả lập multi-GPU. Không thay `CUDA_VISIBLE_DEVICES` giữa lúc parent đang chạy.
 
@@ -314,6 +335,109 @@ legal-ir search \
   --deep-diagnostics artifacts/runs/v1/deep_diag.json
 ```
 
+### Dual short retrieval → long-context pretrained reranker
+
+Preset
+`retrieval/configs/vietnamese_embedding_dual_long_rerank.yaml` khóa ablation
+hiện tại ở BM25 top 50 short chunks, dense top 100 short chunks, HyDE tắt,
+pretrained `AITeamVN/Vietnamese_Reranker`, multi-GPU bật và tối đa 5 document.
+HyDE vẫn là lane tùy chọn: bật `hyde.enabled` nếu muốn thêm lane dense(HyDE) vào
+short candidate union; reranker luôn nhận câu hỏi gốc.
+
+Trong mode này, `fusion.candidate_documents` và
+`fusion.evidence_chunks_per_document` không tham gia scoring; chúng chỉ được giữ
+để schema config tương thích flow legacy. Long pre-ranking chỉ dùng
+`fusion.rrf_k` và `fusion.channel_weights`.
+
+Luồng chính xác:
+
+```text
+BM25@50 short ───────┐
+Dense@100 short ─────┼─ union + dedup short_chunk_id
+HyDE short (optional)┘              ↓ map tất cả long_chunk_ids
+                           dedup long_chunk_id
+                                  ↓ pre-rank bằng weighted short-rank support
+                        full hoặc cutoff top-C long candidates
+                                  ↓ score mọi (query, long_chunk)
+                         reranker top 20 long chunks
+                                  ↓ MaxP long chunk → document
+                            tối đa 5 document IDs
+```
+
+`long_context.candidate_mode` điều khiển cutoff **sau short→long mapping và long
+ID dedup, nhưng trước reranker**:
+
+```yaml
+# Không cắt: số pair/query bằng toàn bộ unique mapped long chunks.
+long_context:
+  enabled: true
+  candidate_mode: full
+  candidate_top_k: null
+  rerank_top_k_chunks: 20
+  document_aggregation: maxp
+  diagnostics_store_all_candidates: true
+```
+
+Để ablate một ngân sách cố định, đổi đồng thời:
+
+```yaml
+long_context:
+  enabled: true
+  candidate_mode: cutoff
+  candidate_top_k: 75
+  rerank_top_k_chunks: 20
+  document_aggregation: maxp
+  diagnostics_store_all_candidates: true
+```
+
+`rerank_top_k_chunks: 20` không có nghĩa model chỉ score 20 pair. Model score
+toàn bộ long candidates đã chọn; pipeline mới lấy top 20 theo reranker score để
+MaxP về document rồi trả tối đa 5 document. Với mode `cutoff`,
+`candidate_top_k` phải là số nguyên dương và không nhỏ hơn
+`rerank_top_k_chunks`.
+
+Chạy local từ repo root sau `pip install -e ./retrieval`:
+
+```bash
+legal-ir search \
+  --queries runs/version1/val.json \
+  --index-dir indexes/vn_embedding_v2_dual_v1 \
+  --dual-chunks-dir /path/to/extracted/dual_chunks_v1 \
+  --config retrieval/configs/vietnamese_embedding_dual_long_rerank.yaml \
+  --output runs/dual_long_pretrained/submission.json \
+  --diagnostics runs/dual_long_pretrained/diagnostics.json \
+  --deep-diagnostics runs/dual_long_pretrained/deep_diagnostics.json
+```
+
+Ví dụ Kaggle sau khi clone repo và attach các Dataset chứa index, dual chunks
+và validation split:
+
+```bash
+cd /kaggle/working/DSC-Legal-IR-QA
+python -m pip install -q ./retrieval
+python -m legal_ir.cli --verbose search \
+  --queries /kaggle/input/<split-dataset>/seed_2026/val.json \
+  --index-dir /kaggle/input/<index-dataset>/index \
+  --dual-chunks-dir /kaggle/input/<dual-chunk-dataset>/dual_v1 \
+  --config retrieval/configs/vietnamese_embedding_dual_long_rerank.yaml \
+  --output /kaggle/working/runs/dual_long_pretrained/submission.json \
+  --diagnostics /kaggle/working/runs/dual_long_pretrained/diagnostics.json \
+  --deep-diagnostics /kaggle/working/runs/dual_long_pretrained/deep_diagnostics.json
+```
+
+`--dual-chunks-dir` phải trỏ tới đúng bộ dual artifacts đã sinh index short.
+Runtime yêu cầu `manifest.json`, `long_chunks.jsonl` và
+`short_to_long.jsonl`; nên giữ thêm `short_chunks.jsonl` trong Dataset để bộ
+artifact đầy đủ và audit được provenance. Pipeline dùng mapping đã nhúng trong
+`INDEX_DIR/chunks.jsonl` để không nạp thêm một dictionary khoảng hai triệu dòng;
+file mapping độc lập vẫn là phần bắt buộc của portable artifact và dùng cho các
+phân tích offline. Khi khởi động, CLI stream-compare toàn bộ mapping độc lập với
+metadata trong index và kiểm tra SHA-256 của mapping/long chunks theo manifest.
+Riêng mode này, loader cũng bỏ các metadata/text không dùng sau khi đã parse:
+short store chỉ giữ ID, `index_text` và mapping; long store chỉ giữ ID,
+`index_text` cùng granularity. Cách nạp compact không đổi hash/index/ranking và
+giảm đáng kể host RAM so với giữ nguyên toàn bộ JSON object.
+
 `submission.json` có đúng dạng:
 
 ```json
@@ -322,9 +446,21 @@ legal-ir search \
 }
 ```
 
-`diagnostics.json` giữ các document đã qua fusion top-K: thứ tự trước rerank, fusion score, reranker score, score/rank của channel nếu document còn trong pool fusion, evidence chunk ID và hypothetical document.
+Trong flow legacy, `diagnostics.json` giữ các document đã qua fusion top-K: thứ tự trước rerank, fusion score, reranker score, score/rank của channel nếu document còn trong pool fusion, evidence chunk ID và hypothetical document.
 
-`deep_diag.json` là trace riêng trước fusion cutoff. Với mỗi query, file lưu toàn bộ kết quả canonical của `bm25`, `dense` và `hyde` ở hai cấp:
+Trong long-context mode, mỗi query còn có `long_context`: các count từ short
+union, số lần mapping trước dedup, số unique long trước/sau cutoff, toàn bộ long
+candidates đã score cùng retrieval support/rank, reranker score/rank và
+provenance short/lane. File cũng giữ riêng reranker top-20 và document ranking
+sau MaxP. Preset giữ `diagnostics_store_all_candidates: true`; không nên tắt nó
+trong ablation này: khi tắt, file vẫn giữ top-20/document results nhưng bỏ danh
+sách đầy đủ trước top-20, nên không replay được toàn bộ promotion/drop.
+Config này điều khiển mức chi tiết; vẫn phải truyền `--diagnostics PATH` thì CLI
+mới ghi `diagnostics.json`.
+
+`deep_diag.json` là trace retrieval-lane riêng: nó nằm trước document fusion của
+legacy và trước short→long mapping/cutoff của mode dual. Với mỗi query, file lưu
+toàn bộ kết quả canonical của `bm25`, `dense` và `hyde` ở hai cấp:
 
 - `chunk_hits`: rank một-based, `chunk_id`, `document_id` và raw score trong chính channel đó;
 - `document_hits`: rank sau MaxP, raw score lớn nhất, `best_chunk_id` và rank của chunk tạo ra score đó;
@@ -372,7 +508,9 @@ Deep diagnostics chỉ được thu thập khi có flag, được stream theo t�
 
 ### Replay top-2 mean từ diagnostics
 
-Nếu muốn thử ablation đổi MaxP sau reranker sang top-2 mean mà không chạy lại model, dùng `diagnostics.json` đã có:
+Utility này áp dụng cho diagnostics của **flow legacy**. Nếu muốn thử ablation
+đổi MaxP sau reranker sang top-2 mean mà không chạy lại model, dùng
+`diagnostics.json` legacy đã có:
 
 ```bash
 python -m legal_ir.diagnostics_top2_mean_submission \
@@ -419,7 +557,9 @@ python /kaggle/input/<source-slug>/retrieval/src/legal_ir/evaluate_recall_precis
 
 ## 8. Ablation tối thiểu
 
-Hai flag runtime không yêu cầu rebuild index:
+Hai flag runtime dưới đây dành cho flow legacy và không yêu cầu rebuild index.
+Không truyền `--disable-reranker` cùng preset long-context, vì mode đó bắt buộc
+có reranker:
 
 ```bash
 # BM25 + dense, không HyDE và không reranker
@@ -432,7 +572,10 @@ legal-ir search ... --disable-hyde
 legal-ir search ... --disable-reranker
 ```
 
-Nên đo candidate recall tại đúng cutoff `fusion.candidate_documents` trước reranker, Recall@5/Precision@5 cuối, latency và peak VRAM. Các giá trị `top_k_chunks`, trọng số HyDE, số candidate documents và số evidence chunks/document trong YAML là điểm khởi đầu, chưa phải hyperparameter đã được xác nhận trên DSC.
+Với legacy, đo candidate recall tại `fusion.candidate_documents`. Với dual,
+đo riêng recall của short union và long pool tại `long_context.candidate_top_k`
+(hoặc full), rồi đo Recall@5/Precision@5 cuối, latency và peak VRAM. Các giá trị
+top-k/trọng số trong YAML vẫn cần được xác nhận trên validation sạch.
 
 ## 9. Test logic không cần tải model
 

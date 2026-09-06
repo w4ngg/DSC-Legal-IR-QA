@@ -71,7 +71,31 @@ class RerankerConfig:
     max_length: int = 2304
     device: str = "auto"
     dtype: str = "auto"
+    # Search-time data parallelism. Each worker owns one complete model replica;
+    # passages from each query are sharded across workers and restored in their
+    # original order, so this does not alter ranking semantics.
+    multi_gpu: bool = False
+    multi_gpu_stall_timeout_seconds: int = 1800
     final_top_k_documents: int = 5
+
+
+@dataclass(frozen=True, slots=True)
+class LongContextConfig:
+    """Optional short-retrieval -> long-context reranking strategy.
+
+    Artifact locations deliberately do not live in the portable YAML config.
+    The CLI supplies the dual-chunk directory at runtime when this mode is
+    enabled.
+    """
+
+    enabled: bool = False
+    candidate_mode: str = "full"
+    candidate_top_k: int | None = None
+    # Every retained long candidate is scored first. This cutoff is then
+    # applied to the reranker ranking before document-level aggregation.
+    rerank_top_k_chunks: int = 20
+    document_aggregation: str = "maxp"
+    diagnostics_store_all_candidates: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +105,7 @@ class PipelineConfig:
     hyde: HyDEConfig = field(default_factory=HyDEConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    long_context: LongContextConfig = field(default_factory=LongContextConfig)
 
     def __post_init__(self) -> None:
         positive_values = {
@@ -100,6 +125,7 @@ class PipelineConfig:
             "hyde.max_new_tokens": self.hyde.max_new_tokens,
             "reranker.batch_size": self.reranker.batch_size,
             "reranker.max_length": self.reranker.max_length,
+            "long_context.rerank_top_k_chunks": self.long_context.rerank_top_k_chunks,
         }
         for name, value in positive_values.items():
             try:
@@ -125,6 +151,17 @@ class PipelineConfig:
             raise ValueError(
                 "dense.multi_gpu_stall_timeout_seconds must be a positive integer"
             )
+        if not isinstance(self.reranker.multi_gpu, bool):
+            raise ValueError("reranker.multi_gpu must be a boolean")
+        reranker_timeout = self.reranker.multi_gpu_stall_timeout_seconds
+        if (
+            isinstance(reranker_timeout, bool)
+            or not isinstance(reranker_timeout, int)
+            or reranker_timeout <= 0
+        ):
+            raise ValueError(
+                "reranker.multi_gpu_stall_timeout_seconds must be a positive integer"
+            )
         if self.reranker.final_top_k_documents > 5:
             raise ValueError(
                 "reranker.final_top_k_documents must be <= 5 for the Task 1 format"
@@ -146,6 +183,55 @@ class PipelineConfig:
             raise ValueError(f"unsupported HyDE dtype: {self.hyde.dtype}")
         if self.reranker.dtype not in allowed_dtypes:
             raise ValueError(f"unsupported reranker dtype: {self.reranker.dtype}")
+        if not isinstance(self.long_context.enabled, bool):
+            raise ValueError("long_context.enabled must be a boolean")
+        if self.long_context.enabled and not self.reranker.enabled:
+            raise ValueError(
+                "long_context.enabled requires reranker.enabled to be true"
+            )
+        if self.long_context.candidate_mode not in {"full", "cutoff"}:
+            raise ValueError(
+                "long_context.candidate_mode must be 'full' or 'cutoff'"
+            )
+        candidate_top_k = self.long_context.candidate_top_k
+        if self.long_context.candidate_mode == "full":
+            if candidate_top_k is not None:
+                raise ValueError(
+                    "long_context.candidate_top_k must be null when "
+                    "candidate_mode is 'full'"
+                )
+        elif (
+            isinstance(candidate_top_k, bool)
+            or not isinstance(candidate_top_k, int)
+            or candidate_top_k <= 0
+        ):
+            raise ValueError(
+                "long_context.candidate_top_k must be a positive integer when "
+                "candidate_mode is 'cutoff'"
+            )
+        rerank_top_k = self.long_context.rerank_top_k_chunks
+        if (
+            isinstance(rerank_top_k, bool)
+            or not isinstance(rerank_top_k, int)
+            or rerank_top_k <= 0
+        ):
+            raise ValueError(
+                "long_context.rerank_top_k_chunks must be a positive integer"
+            )
+        if candidate_top_k is not None and rerank_top_k > candidate_top_k:
+            raise ValueError(
+                "long_context.rerank_top_k_chunks must be <= candidate_top_k"
+            )
+        if self.long_context.document_aggregation != "maxp":
+            raise ValueError(
+                "long_context.document_aggregation must be 'maxp'"
+            )
+        if not isinstance(
+            self.long_context.diagnostics_store_all_candidates, bool
+        ):
+            raise ValueError(
+                "long_context.diagnostics_store_all_candidates must be a boolean"
+            )
         if self.hyde.do_sample and (
             not math.isfinite(self.hyde.temperature) or self.hyde.temperature <= 0
         ):
@@ -186,7 +272,14 @@ class PipelineConfig:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PipelineConfig":
-        allowed = {"bm25", "dense", "hyde", "fusion", "reranker"}
+        allowed = {
+            "bm25",
+            "dense",
+            "hyde",
+            "fusion",
+            "reranker",
+            "long_context",
+        }
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"unknown config sections: {sorted(unknown)}")
@@ -196,6 +289,9 @@ class PipelineConfig:
             hyde=HyDEConfig(**dict(value.get("hyde") or {})),
             fusion=FusionConfig(**dict(value.get("fusion") or {})),
             reranker=RerankerConfig(**dict(value.get("reranker") or {})),
+            long_context=LongContextConfig(
+                **dict(value.get("long_context") or {})
+            ),
         )
 
     @classmethod

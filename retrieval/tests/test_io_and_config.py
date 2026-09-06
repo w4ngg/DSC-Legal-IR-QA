@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from legal_ir.cli import build_parser
+from legal_ir.cli import _load_dual_chunk_assets, build_parser
 from legal_ir.config import PipelineConfig
 from legal_ir.io import (
     ChunkStore,
@@ -191,11 +193,140 @@ class IOAndConfigTest(unittest.TestCase):
                 "submission.json",
                 "--deep-diagnostics",
                 "deep_diag.json",
+                "--dual-chunks-dir",
+                "dual_v1",
             ]
         )
 
         self.assertEqual(args.deep_diagnostics, Path("deep_diag.json"))
+        self.assertEqual(args.dual_chunks_dir, Path("dual_v1"))
         self.assertIsNone(args.diagnostics)
+
+    def test_dual_runtime_assets_match_indexed_short_chunk_manifest(self) -> None:
+        namespace = "dual_char_v1_test"
+        short_id = f"DOC:{namespace}:short:000000"
+        long_id = f"DOC:{namespace}:long:000000"
+        short_chunks = ChunkStore(
+            [
+                Chunk(
+                    short_id,
+                    "DOC",
+                    "short",
+                    metadata={
+                        "granularity": "short",
+                        "primary_long_chunk_id": long_id,
+                        "long_chunk_ids": [long_id],
+                    },
+                )
+            ]
+        )
+        config = PipelineConfig.from_mapping(
+            {
+                "hyde": {"enabled": False},
+                "long_context": {"enabled": True},
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            long_chunks_path = root / "long_chunks.jsonl"
+            mapping_path = root / "short_to_long.jsonl"
+            ChunkStore(
+                [
+                    Chunk(
+                        long_id,
+                        "DOC",
+                        "long",
+                        metadata={"granularity": "long"},
+                    )
+                ]
+            ).save_jsonl(long_chunks_path)
+            mapping_path.write_text(
+                json.dumps(
+                    {
+                        "short_chunk_id": short_id,
+                        "document_id": "DOC",
+                        "primary_long_chunk_id": long_id,
+                        "long_chunk_ids": [long_id],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "artifact_type": "legal_ir_dual_granularity_chunks",
+                        "outputs": {
+                            "long_chunks": {
+                                "records": 1,
+                                "sha256": hashlib.sha256(
+                                    long_chunks_path.read_bytes()
+                                ).hexdigest(),
+                            },
+                            "short_to_long": {
+                                "records": 1,
+                                "sha256": hashlib.sha256(
+                                    mapping_path.read_bytes()
+                                ).hexdigest(),
+                            },
+                        },
+                        "statistics": {
+                            "short_chunks_written": 1,
+                            "long_chunks_written": 1,
+                            "mappings_written": 1,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            assets = _load_dual_chunk_assets(
+                SimpleNamespace(dual_chunks_dir=root),
+                config,
+                short_chunks=short_chunks,
+            )
+            mapping_path.write_text(
+                mapping_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                _load_dual_chunk_assets(
+                    SimpleNamespace(dual_chunks_dir=root),
+                    config,
+                    short_chunks=short_chunks,
+                )
+
+        assert assets is not None
+        self.assertEqual(len(assets.long_chunks), 1)
+        self.assertEqual(
+            assets.mappings.get(short_id).long_chunk_ids,
+            (long_id,),
+        )
+
+    def test_dual_runtime_assets_are_required_only_when_mode_is_enabled(self) -> None:
+        chunks = ChunkStore([Chunk("legacy", "DOC", "short")])
+        legacy_assets = _load_dual_chunk_assets(
+            SimpleNamespace(dual_chunks_dir=None),
+            PipelineConfig(),
+            short_chunks=chunks,
+        )
+        self.assertIsNone(legacy_assets)
+
+        config = PipelineConfig.from_mapping(
+            {
+                "hyde": {"enabled": False},
+                "long_context": {"enabled": True},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "--dual-chunks-dir is required"):
+            _load_dual_chunk_assets(
+                SimpleNamespace(dual_chunks_dir=None),
+                config,
+                short_chunks=chunks,
+            )
 
 
 if __name__ == "__main__":

@@ -122,6 +122,64 @@ class IndexManifestTest(unittest.TestCase):
         self.assertIs(bundle.bm25, bm25_backend)
         self.assertIs(bundle.dense, dense_backend)
 
+    def test_long_context_load_keeps_only_search_and_mapping_fields(self) -> None:
+        default = PipelineConfig()
+        config = replace(
+            default,
+            long_context=replace(default.long_context, enabled=True),
+        )
+        namespace = "dual_char_v1_test"
+        long_id = f"DOC:{namespace}:long:000000"
+        chunks = ChunkStore(
+            [
+                Chunk(
+                    f"DOC:{namespace}:short:000000",
+                    "DOC",
+                    "original passage",
+                    "title | original passage",
+                    {
+                        "granularity": "short",
+                        "primary_long_chunk_id": long_id,
+                        "long_chunk_ids": [long_id],
+                        "unused_large_metadata": "discard me",
+                    },
+                )
+            ]
+        )
+        bm25_backend = object()
+        dense_backend = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chunks.save_jsonl(root / "chunks.jsonl")
+            (root / "manifest.json").write_text(
+                json.dumps(_manifest(config, chunks)),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "legal_ir.indexing.BM25Index.load",
+                    return_value=bm25_backend,
+                ),
+                patch(
+                    "legal_ir.indexing.FaissDenseIndex.load",
+                    return_value=dense_backend,
+                ),
+            ):
+                bundle = load_indexes(root, config)
+
+        compact = bundle.chunks[0]
+        self.assertEqual(compact.index_text, "title | original passage")
+        self.assertEqual(compact.passage, "title | original passage")
+        self.assertIsNone(compact.retrieval_text)
+        self.assertEqual(
+            compact.metadata,
+            {
+                "granularity": "short",
+                "primary_long_chunk_id": long_id,
+                "long_chunk_ids": (long_id,),
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

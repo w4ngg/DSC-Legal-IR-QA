@@ -1,27 +1,24 @@
-# Đây là baseline ưu tiên recall. Các top-k cần được tune trên validation sạch.
+# Dual-granularity pretrained-reranker ablation (Kaggle T4x2).
+# Supply the portable dual artifact location at search time with
+# `--dual-chunks-dir`; this config intentionally contains no machine path.
 bm25:
   method: lucene
   k1: 1.2
   b: 0.75
-  top_k_chunks: 300
+  top_k_chunks: 50
   mmap: true
 
-# AITeamVN baseline. For Harrier use configs/vietlegal_harrier.yaml or replace
-# model_name/revision/max_length with the values from that preset.
 dense:
   model_name: AITeamVN/Vietnamese_Embedding_v2
   revision: 18b44161e041bf1d3a333ab5144b5b7b93f914d2
-  top_k_chunks: 200
-  batch_size: 32
+  top_k_chunks: 100
+  batch_size: 16
   max_length: 2048
   device: auto
-  dtype: auto
+  dtype: float16
   normalize_embeddings: true
-  # Build corpus embeddings on every visible CUDA GPU; query search stays single-GPU.
   multi_gpu: true
-  # Macro-block per isolated GPU worker; null uses the safe default of 256 texts.
-  multi_process_chunk_size: null
-  # Fail instead of hanging forever when a GPU worker stops reporting progress.
+  multi_process_chunk_size: 256
   multi_gpu_stall_timeout_seconds: 1800
   index_type: flat
   hnsw_m: 32
@@ -29,7 +26,7 @@ dense:
   hnsw_ef_search: 128
 
 hyde:
-  enabled: true
+  enabled: false
   model_name: AITeamVN/Vi-Qwen2-1.5B-RAG
   revision: c8272ce4ad08da4cc27b4bda59faabc66caedf07
   top_k_chunks: 200
@@ -41,6 +38,8 @@ hyde:
   dtype: auto
   trust_remote_code: false
 
+# Retained for legacy mode compatibility; long-context mode unions short chunks
+# directly and uses rrf_k/channel_weights to rank mapped long candidates.
 fusion:
   rrf_k: 60
   candidate_documents: 30
@@ -57,19 +56,18 @@ reranker:
   batch_size: 4
   max_length: 2304
   device: auto
-  dtype: auto
-  # Passage-level data parallelism within each query; false preserves legacy runtime.
-  multi_gpu: false
+  dtype: float16
+  multi_gpu: true
   multi_gpu_stall_timeout_seconds: 1800
   final_top_k_documents: 5
 
-# Disabled by default: the established document-RRF + short-evidence flow is
-# unchanged unless callers explicitly enable the dual-granularity strategy.
 long_context:
-  enabled: false
+  enabled: true
+  # `full`: score every unique mapped long chunk. For an ablation cutoff, use
+  # candidate_mode: cutoff together with a positive candidate_top_k.
   candidate_mode: full
   candidate_top_k: null
-  # Score every selected long candidate, retain reranker top-20, then MaxP to docs.
+  # Apply this cutoff after cross-encoder scoring and before document MaxP.
   rerank_top_k_chunks: 20
   document_aggregation: maxp
   diagnostics_store_all_candidates: true

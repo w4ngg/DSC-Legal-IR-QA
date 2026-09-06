@@ -191,6 +191,18 @@ class SearchResponse:
     results: tuple[SearchResult, ...]
     hypothetical_document: str | None = None
     fused_candidates: tuple[SearchResult, ...] = ()
+    # Kept generic here so the canonical dual-rerank outcome can expose its
+    # complete, replayable provenance without coupling core result types to the
+    # optional strategy. The regular diagnostics writer serializes this field.
+    long_context_diagnostics: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.long_context_diagnostics is not None:
+            object.__setattr__(
+                self,
+                "long_context_diagnostics",
+                dict(self.long_context_diagnostics),
+            )
 
     @property
     def document_ids(self) -> list[str]:
@@ -210,4 +222,6 @@ class SearchResponse:
         }
         if include_hypothesis:
             value["hypothetical_document"] = self.hypothetical_document
+        if self.long_context_diagnostics is not None:
+            value["long_context"] = dict(self.long_context_diagnostics)
         return value

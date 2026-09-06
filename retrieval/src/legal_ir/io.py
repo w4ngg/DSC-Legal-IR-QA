@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping, TextIO
@@ -35,7 +36,17 @@ class ChunkStore:
             raise KeyError(f"unknown chunk_id: {chunk_id}") from exc
 
     @classmethod
-    def load_jsonl(cls, path: str | Path) -> "ChunkStore":
+    def load_jsonl(
+        cls,
+        path: str | Path,
+        *,
+        compact_for_search: bool = False,
+        retain_dual_mapping: bool = False,
+    ) -> "ChunkStore":
+        if retain_dual_mapping and not compact_for_search:
+            raise ValueError(
+                "retain_dual_mapping requires compact_for_search"
+            )
         chunks: list[Chunk] = []
         with Path(path).open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -45,7 +56,89 @@ class ChunkStore:
                     value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError("record must be a JSON object")
-                    chunks.append(Chunk.from_dict(value))
+                    if not compact_for_search:
+                        chunks.append(Chunk.from_dict(value))
+                        continue
+
+                    passage = value.get("passage", value.get("text"))
+                    retrieval_text = value.get("retrieval_text")
+                    normalized_retrieval_text = (
+                        str(retrieval_text).strip()
+                        if retrieval_text is not None
+                        else ""
+                    )
+                    index_text = normalized_retrieval_text or passage
+                    raw_metadata = value.get("metadata") or {}
+                    if not isinstance(raw_metadata, dict):
+                        raise ValueError("metadata must be an object")
+                    metadata: dict[str, Any] = {}
+                    granularity = raw_metadata.get("granularity")
+                    if granularity is not None:
+                        metadata["granularity"] = str(granularity)
+                    if retain_dual_mapping:
+                        primary_long_id = raw_metadata.get(
+                            "primary_long_chunk_id"
+                        )
+                        raw_long_ids = raw_metadata.get("long_chunk_ids")
+                        if (
+                            not isinstance(primary_long_id, str)
+                            or not primary_long_id.strip()
+                        ):
+                            raise ValueError(
+                                "primary_long_chunk_id must be a non-empty string"
+                            )
+                        if (
+                            not isinstance(raw_long_ids, (list, tuple))
+                            or not raw_long_ids
+                            or any(
+                                not isinstance(long_chunk_id, str)
+                                or not long_chunk_id.strip()
+                                for long_chunk_id in raw_long_ids
+                            )
+                        ):
+                            raise ValueError(
+                                "long_chunk_ids must be a non-empty string array"
+                            )
+                        interned_primary_long_id = sys.intern(primary_long_id)
+                        interned_long_ids = tuple(
+                            sys.intern(str(long_chunk_id))
+                            for long_chunk_id in raw_long_ids
+                        )
+                        if (
+                            len(set(interned_long_ids)) != len(interned_long_ids)
+                            or interned_primary_long_id not in interned_long_ids
+                        ):
+                            raise ValueError(
+                                "dual mapping IDs must be unique and contain "
+                                "primary_long_chunk_id"
+                            )
+                        metadata[
+                            "primary_long_chunk_id"
+                        ] = interned_primary_long_id
+                        metadata["long_chunk_ids"] = interned_long_ids
+
+                    raw_document_id = value.get(
+                        "document_id", value.get("doc_id")
+                    )
+                    if raw_document_id is None:
+                        raise ValueError("document_id is required")
+                    raw_chunk_id = value.get("chunk_id")
+                    if raw_chunk_id is None:
+                        raise ValueError("chunk_id is required")
+                    document_id = sys.intern(str(raw_document_id).strip())
+                    chunk_id = str(raw_chunk_id).strip()
+                    if granularity == "long":
+                        # Long IDs are shared by many short mapping tuples. Once
+                        # the short store has interned them, reuse those objects.
+                        chunk_id = sys.intern(chunk_id)
+                    chunks.append(
+                        Chunk(
+                            chunk_id=chunk_id,
+                            document_id=document_id,
+                            passage=index_text,
+                            metadata=metadata,
+                        )
+                    )
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     raise ValueError(f"invalid chunk at {path}:{line_number}: {exc}") from exc
         return cls(chunks)

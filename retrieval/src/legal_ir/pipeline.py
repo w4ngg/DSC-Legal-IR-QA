@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from .config import PipelineConfig
+from .dual_rerank import (
+    DualChunkAssets,
+    LongCandidatePool,
+    LongDocumentResult,
+    build_long_candidate_pool,
+    rerank_long_candidate_pool,
+)
 from .fusion import fuse_ranked_channels, rank_channels, rank_documents
 from .hyde import normalize_hyde_text
 from .interfaces import (
@@ -16,6 +23,7 @@ from .io import ChunkStore
 from .schema import (
     DeepQueryDiagnostics,
     DocumentCandidate,
+    RankedChunk,
     RetrievalChannelDiagnostics,
     ScoredChunk,
     SearchResponse,
@@ -35,17 +43,26 @@ class RetrievalPipeline:
         config: PipelineConfig,
         hyde_generator: HypotheticalDocumentGenerator | None = None,
         reranker: PassageReranker | None = None,
+        dual_chunk_assets: DualChunkAssets | None = None,
     ) -> None:
         if config.hyde.enabled and hyde_generator is None:
             raise ValueError("HyDE is enabled but no generator was provided")
         if config.reranker.enabled and reranker is None:
             raise ValueError("reranking is enabled but no reranker was provided")
+        if config.long_context.enabled and dual_chunk_assets is None:
+            raise ValueError(
+                "long-context reranking is enabled but no dual chunk assets "
+                "were provided"
+            )
+        if config.long_context.enabled and not config.reranker.enabled:
+            raise ValueError("long-context reranking requires an enabled reranker")
         self.chunks = chunks
         self.bm25 = bm25
         self.dense = dense
         self.config = config
         self.hyde_generator = hyde_generator
         self.reranker = reranker
+        self.dual_chunk_assets = dual_chunk_assets
 
     def _validate_hits(
         self, channel: str, hits: Sequence[ScoredChunk]
@@ -118,6 +135,108 @@ class RetrievalPipeline:
             evidence_rerank_scores=dict(candidate.evidence_rerank_scores),
         )
 
+    @staticmethod
+    def _long_pool_to_fused_results(
+        pool: LongCandidatePool,
+    ) -> tuple[SearchResult, ...]:
+        """Expose deterministic pre-reranker MaxP document candidates.
+
+        Long candidates are already ordered by mapped short-chunk RRF support,
+        so the first occurrence of a document is its strongest retrieval-side
+        long chunk.
+        """
+
+        seen_documents: set[str] = set()
+        results: list[SearchResult] = []
+        for candidate in pool.candidates:
+            if candidate.document_id in seen_documents:
+                continue
+            seen_documents.add(candidate.document_id)
+            results.append(
+                SearchResult(
+                    document_id=candidate.document_id,
+                    score=candidate.retrieval_support_score,
+                    fusion_score=candidate.retrieval_support_score,
+                    rerank_score=None,
+                    evidence_chunk_ids=(candidate.long_chunk_id,),
+                    channel_ranks=dict(candidate.channel_best_ranks),
+                    channel_scores=dict(candidate.channel_contributions),
+                )
+            )
+        return tuple(results)
+
+    @staticmethod
+    def _long_document_to_result(
+        document: LongDocumentResult,
+    ) -> SearchResult:
+        best = document.contributing_long_chunks[0]
+        return SearchResult(
+            document_id=document.document_id,
+            score=document.score,
+            fusion_score=best.candidate.retrieval_support_score,
+            rerank_score=document.score,
+            evidence_chunk_ids=tuple(
+                item.long_chunk_id
+                for item in document.contributing_long_chunks
+            ),
+            channel_ranks=dict(best.candidate.channel_best_ranks),
+            channel_scores=dict(best.candidate.channel_contributions),
+            evidence_rerank_scores={
+                item.long_chunk_id: item.reranker_score
+                for item in document.contributing_long_chunks
+            },
+        )
+
+    def _search_long_context(
+        self,
+        query: str,
+        ranked_channels: Mapping[str, Sequence[RankedChunk]],
+        *,
+        hypothesis: str | None,
+    ) -> SearchResponse:
+        assert self.dual_chunk_assets is not None
+        assert self.reranker is not None
+
+        long_config = self.config.long_context
+        long_candidate_limit = (
+            None
+            if long_config.candidate_mode == "full"
+            else long_config.candidate_top_k
+        )
+        pool = build_long_candidate_pool(
+            ranked_channels,
+            assets=self.dual_chunk_assets,
+            channel_weights=self.config.fusion.channel_weights,
+            rrf_k=self.config.fusion.rrf_k,
+            long_candidate_limit=long_candidate_limit,
+        )
+        outcome = rerank_long_candidate_pool(
+            query,
+            pool,
+            long_chunks=self.dual_chunk_assets.long_chunks,
+            reranker=self.reranker,
+            post_reranker_long_top_k=long_config.rerank_top_k_chunks,
+            final_top_k_documents=self.config.reranker.final_top_k_documents,
+        )
+        long_diagnostics = outcome.to_diagnostics_dict()
+        long_diagnostics["candidate_mode"] = long_config.candidate_mode
+        long_diagnostics["stores_all_scored_long_candidates"] = bool(
+            long_config.diagnostics_store_all_candidates
+        )
+        if not long_config.diagnostics_store_all_candidates:
+            long_diagnostics.pop("long_candidates", None)
+
+        return SearchResponse(
+            query=query,
+            results=tuple(
+                self._long_document_to_result(document)
+                for document in outcome.results
+            ),
+            hypothetical_document=hypothesis,
+            fused_candidates=self._long_pool_to_fused_results(pool),
+            long_context_diagnostics=long_diagnostics,
+        )
+
     def _search(
         self, query: str, *, capture_deep_diagnostics: bool
     ) -> tuple[SearchResponse, DeepQueryDiagnostics | None]:
@@ -179,6 +298,16 @@ class RetrievalPipeline:
                 },
             )
 
+        if self.config.long_context.enabled:
+            return (
+                self._search_long_context(
+                    query,
+                    ranked_channels,
+                    hypothesis=hypothesis,
+                ),
+                deep_diagnostics,
+            )
+
         candidates = fuse_ranked_channels(
             ranked_channels,
             channel_weights=self.config.fusion.channel_weights,
@@ -202,6 +331,14 @@ class RetrievalPipeline:
             ),
             deep_diagnostics,
         )
+
+    def close(self) -> None:
+        """Release persistent model workers owned by runtime adapters."""
+
+        if self.reranker is not None:
+            close = getattr(self.reranker, "close", None)
+            if callable(close):
+                close()
 
     def search(self, query: str) -> SearchResponse:
         """Run retrieval without retaining the full pre-fusion trace."""

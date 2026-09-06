@@ -112,7 +112,11 @@ def load_indexes(index_dir: str | Path, config: PipelineConfig) -> IndexBundle:
             f"unsupported index format version: {manifest.get('format_version')}"
         )
 
-    chunks = ChunkStore.load_jsonl(source / "chunks.jsonl")
+    chunks = ChunkStore.load_jsonl(
+        source / "chunks.jsonl",
+        compact_for_search=config.long_context.enabled,
+        retain_dual_mapping=config.long_context.enabled,
+    )
     if int(manifest.get("chunk_count", -1)) != len(chunks):
         raise ValueError("index manifest and chunks.jsonl have different row counts")
     if manifest.get("chunk_records_sha256") != _chunk_records_hash(chunks):
