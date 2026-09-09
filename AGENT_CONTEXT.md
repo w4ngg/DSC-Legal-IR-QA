@@ -295,6 +295,21 @@ Manifest index không lưu `hnsw_ef_search` vì đó là search-time config, nh�
 
 `dual_chunks_v1.zip` ở repo root chứa thư mục `dual_chunks_v1/` với đủ `short_chunks.jsonl` (3.207.358.735 bytes), `short_to_long.jsonl` (598.433.273 bytes), `long_chunks.jsonl` (1.376.834.383 bytes) và `manifest.json`. Workspace hiện chưa giải nén thư mục này; local long-context search phải extract trước và trỏ `--dual-chunks-dir` vào thư mục `dual_chunks_v1/`. Trên Kaggle nên dùng Dataset đã giải nén thay vì tự bung hơn 5 GB vào `/kaggle/working`.
 
+Người dùng xác nhận ngày 2026-09-09 rằng cả short index và long index đã được
+build trên Kaggle. Long index chưa có artifact/path local trong workspace nên
+chưa được agent kiểm tra manifest hay số row trực tiếp. Stage 1 reranker mới
+không build lại hai index và không cần diagnostics: module
+`legal_ir.mine_reranker_stage1` dùng mapping nhúng trong short
+`chunks.jsonl`, reconstruct vector từ long `dense.faiss` để chọn positive giới
+hạn trong gold document, rồi dùng pretrained reranker mine grouped data. Module
+`legal_ir.train_reranker_stage1` train listwise `1 positive + N negatives` bằng
+DDP và lưu checkpoint Hugging Face. Dataset bắt buộc verify `train.json` qua
+`split_manifest.json` trừ khi người chạy chủ động dùng flag unsafe; mọi gold
+document của query đều bị loại khỏi negatives. Hướng dẫn Kaggle và cách nạp
+checkpoint nằm ở mục 9 của `retrieval/README.md`. Hai notebook thực thi là
+`notebooks/kaggle_mine_reranker_stage1.ipynb` và
+`notebooks/kaggle_train_reranker_stage1.ipynb`.
+
 System Python lúc audit không cài `numpy`, `faiss`, `bm25s`, `torch`, `transformers`, `sentence-transformers` hay `PyYAML`. Vì vậy unit tests mock/standard-library và script `analysis_v1.py` chạy được, nhưng current shell chưa thể load index hoặc chạy retrieval/model thật nếu chưa tạo environment và cài `./retrieval[dev]`.
 
 ### Validation Harrier v1

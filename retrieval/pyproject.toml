@@ -31,6 +31,8 @@ legal-ir-chunk-fixed-size = "legal_ir.chunk_fixed_size:main"
 legal-ir-create-val-test = "legal_ir.create_val_test:main"
 legal-ir-diagnostics-top2-mean = "legal_ir.diagnostics_top2_mean_submission:main"
 legal-ir-evaluate = "legal_ir.evaluate_recall_precision:main"
+legal-ir-mine-reranker-stage1 = "legal_ir.mine_reranker_stage1:main"
+legal-ir-train-reranker-stage1 = "legal_ir.train_reranker_stage1:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

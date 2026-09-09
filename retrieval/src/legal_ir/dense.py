@@ -257,6 +257,97 @@ class FaissDenseIndex:
             )
         return hits
 
+    def encode_queries(
+        self,
+        texts: list[str],
+        *,
+        show_progress: bool = False,
+    ) -> Any:
+        """Encode a batch of questions with the index's pinned query encoder."""
+
+        if not texts:
+            _, np = self._libraries()
+            return np.empty((0, int(self._index.d)), dtype=np.float32)
+        _, np = self._libraries()
+        vectors = self._encoder.encode_queries(
+            texts,
+            show_progress=show_progress,
+        )
+        vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape != (
+            len(texts),
+            int(self._index.d),
+        ):
+            raise ValueError(f"unexpected query embedding shape: {vectors.shape}")
+        if not np.isfinite(vectors).all():
+            raise ValueError("query embeddings contain NaN or infinite values")
+        return vectors
+
+    def search_encoded(self, vectors: Any, top_k: int) -> list[list[ScoredChunk]]:
+        """Search pre-encoded queries without invoking the model a second time."""
+
+        _, np = self._libraries()
+        matrix = np.ascontiguousarray(vectors, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[1] != int(self._index.d):
+            raise ValueError(
+                f"encoded queries must have shape (n, {int(self._index.d)})"
+            )
+        if not np.isfinite(matrix).all():
+            raise ValueError("encoded queries contain NaN or infinite values")
+        if top_k <= 0:
+            return [[] for _ in range(matrix.shape[0])]
+
+        k = min(top_k, len(self._chunks))
+        scores, positions = self._index.search(matrix, k)
+        results: list[list[ScoredChunk]] = []
+        for row_positions, row_scores in zip(positions, scores, strict=True):
+            hits: list[ScoredChunk] = []
+            for raw_position, raw_score in zip(
+                row_positions,
+                row_scores,
+                strict=True,
+            ):
+                position = int(raw_position)
+                if position < 0 or position >= len(self._chunks):
+                    continue
+                chunk = self._chunks[position]
+                hits.append(
+                    ScoredChunk(
+                        chunk_id=chunk.chunk_id,
+                        document_id=chunk.document_id,
+                        score=float(raw_score),
+                    )
+                )
+            results.append(hits)
+        return results
+
+    def reconstruct_all_vectors(self) -> Any:
+        """Return corpus vectors for offline, document-restricted mining.
+
+        This intentionally exposes a copy only for training-data construction;
+        online search continues to use FAISS directly. The current flat index
+        needs roughly ``chunk_count * dimension * 4`` bytes of host RAM.
+        """
+
+        _, np = self._libraries()
+        try:
+            vectors = self._index.reconstruct_n(0, len(self._chunks))
+        except Exception as exc:  # pragma: no cover - backend-specific failure
+            raise RuntimeError(
+                "the dense index cannot reconstruct corpus vectors; use a FAISS "
+                "index type that stores reconstructable vectors"
+            ) from exc
+        vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+        expected_shape = (len(self._chunks), int(self._index.d))
+        if vectors.shape != expected_shape:
+            raise ValueError(
+                f"unexpected reconstructed embedding shape: {vectors.shape}; "
+                f"expected {expected_shape}"
+            )
+        if not np.isfinite(vectors).all():
+            raise ValueError("reconstructed embeddings contain NaN or infinite values")
+        return vectors
+
 
 # Compatibility alias for code written against the first BGE-M3 skeleton.
 BGEM3Encoder = VietnameseEmbeddingEncoder

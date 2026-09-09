@@ -577,7 +577,126 @@ Với legacy, đo candidate recall tại `fusion.candidate_documents`. Với dua
 (hoặc full), rồi đo Recall@5/Precision@5 cuối, latency và peak VRAM. Các giá trị
 top-k/trọng số trong YAML vẫn cần được xác nhận trên validation sạch.
 
-## 9. Test logic không cần tải model
+## 9. Stage 1 fine-tune reranker từ short index và long index
+
+Stage 1 gồm đúng hai job tách biệt: mine grouped dataset bằng pretrained
+reranker `R0`, sau đó train `R1` bằng grouped listwise cross-entropy. Không dùng
+validation/test để mine. Input `--gold` phải là `seed_2026/train.json`; mặc định
+script bắt buộc có `split_manifest.json` để kiểm tra filename, số query và
+SHA-256 của train split.
+
+Hai notebook Kaggle chạy trọn quy trình nằm tại
+`notebooks/kaggle_mine_reranker_stage1.ipynb` và
+`notebooks/kaggle_train_reranker_stage1.ipynb`. Mỗi notebook có cell khai báo
+đường dẫn Dataset riêng, validation artifact, smoke run và full run.
+
+Miner dùng index có sẵn, không build lại index:
+
+- short BM25 top 50 + short dense top 100, union và map sang toàn bộ unique long
+  chunks theo config production;
+- với mỗi gold document, long dense chọn top 8 chunk trong chính document đó,
+  rồi pretrained reranker chọn một representative positive;
+- candidate negative là union của mapped production pool và global long-dense
+  top 60; loại mọi gold document, MaxP còn một chunk/document;
+- mỗi group có một positive và bảy negative document khác nhau, ưu tiên
+  violating, near-margin, long-dense và mapped hard negative.
+
+Kaggle notebook cell để mine:
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+REPO_ROOT = Path("/kaggle/working/DSC-Legal-IR-QA")
+TRAIN_SPLIT = Path("/kaggle/working/artifacts/splits/seed_2026/train.json")
+SPLIT_MANIFEST = TRAIN_SPLIT.parent / "split_manifest.json"
+SHORT_INDEX_DIR = Path("/kaggle/input/<short-index-dataset>/<short-index-folder>")
+LONG_INDEX_DIR = Path("/kaggle/input/<long-index-dataset>/<long-index-folder>")
+CONFIG = REPO_ROOT / "retrieval/configs/vietnamese_embedding_dual_long_rerank.yaml"
+STAGE1_DATA_DIR = Path("/kaggle/working/artifacts/reranker/stage1_data")
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "legal_ir.mine_reranker_stage1",
+        "--gold", str(TRAIN_SPLIT),
+        "--split-manifest", str(SPLIT_MANIFEST),
+        "--short-index-dir", str(SHORT_INDEX_DIR),
+        "--long-index-dir", str(LONG_INDEX_DIR),
+        "--config", str(CONFIG),
+        "--output-dir", str(STAGE1_DATA_DIR),
+        "--positive-dense-top-k", "8",
+        "--direct-long-top-k", "60",
+        "--negatives-per-positive", "7",
+    ],
+    check=True,
+)
+```
+
+Nên smoke test trước bằng `--max-queries 10` và một output directory riêng.
+Miner reconstruct long vectors ở RAM để tìm top chunk giới hạn trong từng gold
+document; với long index hiện tại khoảng 205 nghìn vector × 1.024 chiều, bản sao
+float32 cần khoảng 0,78 GiB host RAM. Dataset được stream qua file tạm rồi mới
+atomic replace thành `stage1_train.jsonl`; `stage1_manifest.json` khóa hash của
+dataset, split, config và hai index manifest.
+
+Train trên Kaggle T4×2 bằng DDP (`torchrun` semantics):
+
+```python
+CHECKPOINT_ROOT = Path("/kaggle/working/artifacts/reranker/stage1_model")
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        "-m",
+        "legal_ir.train_reranker_stage1",
+        "--train-data", str(STAGE1_DATA_DIR / "stage1_train.jsonl"),
+        "--data-manifest", str(STAGE1_DATA_DIR / "stage1_manifest.json"),
+        "--config", str(CONFIG),
+        "--output-dir", str(CHECKPOINT_ROOT),
+        "--epochs", "1",
+        "--per-device-group-batch-size", "1",
+        "--gradient-accumulation-steps", "8",
+        "--learning-rate", "2e-5",
+        "--mixed-precision", "fp16",
+        "--gradient-checkpointing",
+    ],
+    check=True,
+)
+```
+
+Đây là data parallel: mỗi T4 giữ một model replica và nhận các groups khác nhau.
+`per-device-group-batch-size=1` tương ứng 8 query–passage pairs/GPU vì group có
+1 positive + 7 negatives. Nếu OOM, giảm số negatives khi mine (tạo ablation mới)
+hoặc giảm `max_length`; không âm thầm cắt một group đã mine khi train.
+
+Sau mỗi epoch, checkpoint Hugging Face nằm tại
+`stage1_model/checkpoint-step-<N>/`; mặc định chỉ giữ checkpoint mới nhất và
+không lưu optimizer state để tiết kiệm disk. `LAST_CHECKPOINT.txt` chứa tên thư
+mục cần dùng. Kiểm tra artifact:
+
+```python
+checkpoint_name = (CHECKPOINT_ROOT / "LAST_CHECKPOINT.txt").read_text().strip()
+checkpoint = CHECKPOINT_ROOT / checkpoint_name
+assert (checkpoint / "config.json").is_file()
+assert (checkpoint / "stage1_training_manifest.json").is_file()
+assert any(checkpoint.glob("*.safetensors")) or (checkpoint / "pytorch_model.bin").is_file()
+print("Stage 1 checkpoint:", checkpoint)
+```
+
+Để inference/ablation với `R1`, copy config sang file mới, đặt
+`reranker.model_name` bằng absolute checkpoint path và
+`reranker.revision: null`. Giữ preset pretrained cũ nguyên vẹn để so sánh công
+bằng R0 với R1 trên cùng validation. Stage 2 là một job tiếp theo: dùng R1 này
+re-mine negative rồi train R2; không tái sử dụng nguyên negative Stage 1.
+
+## 10. Test logic không cần tải model
 
 ```bash
 PYTHONPATH=retrieval/src python -m unittest discover -s retrieval/tests -v
