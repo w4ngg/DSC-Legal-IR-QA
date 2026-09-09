@@ -588,7 +588,9 @@ SHA-256 của train split.
 Hai notebook Kaggle chạy trọn quy trình nằm tại
 `notebooks/kaggle_mine_reranker_stage1.ipynb` và
 `notebooks/kaggle_train_reranker_stage1.ipynb`. Mỗi notebook có cell khai báo
-đường dẫn Dataset riêng, validation artifact, smoke run và full run.
+đường dẫn Dataset riêng, validation artifact, smoke run và full run. Notebook
+mining còn có cell tùy chọn tạo lại split 5.600/700/700 trực tiếp từ
+`IR/train.json`; mặc định tái sử dụng split đầy đủ đã tồn tại và không ghi đè.
 
 Miner dùng index có sẵn, không build lại index:
 
